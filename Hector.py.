@@ -1,0 +1,409 @@
+
+package com.example.hector
+
+import android.Manifest
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.RecognitionListener
+import android.speech.tts.TextToSpeech
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private val Fondo = Color(0xFF050B16)
+private val Azul = Color(0xFF21C8FF)
+private val Panel = Color(0xFF101D30)
+
+class MainActivity : ComponentActivity() {
+
+    private var tts: TextToSpeech? = null
+    private var recognizer: SpeechRecognizer? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale("es", "MX")
+            }
+        }
+
+        setContent {
+            HectorApp(
+                escuchar = { escucharVoz(it) },
+                ejecutar = { procesarComando(it) },
+                hablar = { decir(it) }
+            )
+        }
+    }
+
+    private fun decir(texto: String) {
+        tts?.speak(
+            texto,
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            "HECTOR_RESPUESTA"
+        )
+    }
+
+    private fun escucharVoz(
+        resultado: (String) -> Unit
+    ) {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            decir("El reconocimiento de voz no está disponible.")
+            return
+        }
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.RECORD_AUDIO), 100
+            )
+            decir("Autoriza el micrófono y vuelve a intentarlo.")
+            return
+        }
+
+        recognizer?.destroy()
+        recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+
+        recognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+
+            override fun onError(error: Int) {
+                runOnUiThread {
+                    decir("No pude entenderte. Intenta otra vez.")
+                }
+            }
+
+            override fun onResults(bundle: Bundle?) {
+                val texto = bundle
+                    ?.getStringArrayList(
+                        SpeechRecognizer.RESULTS_RECOGNITION
+                    )?.firstOrNull().orEmpty()
+
+                runOnUiThread {
+                    if (texto.isNotBlank()) resultado(texto)
+                }
+            }
+
+            override fun onPartialResults(bundle: Bundle?) {}
+            override fun onEvent(type: Int, params: Bundle?) {}
+        })
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        intent.putExtra(
+            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+        )
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-MX")
+        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Habla con HÉCTOR")
+
+        recognizer?.startListening(intent)
+    }
+
+    private fun procesarComando(entrada: String): String {
+        val texto = entrada.lowercase(Locale.ROOT)
+            .trim()
+
+        val respuesta: String
+
+        when {
+            texto.contains("hora") -> {
+                respuesta = "Son las " +
+                    SimpleDateFormat("HH:mm", Locale("es", "MX"))
+                        .format(Date())
+            }
+
+            texto.contains("fecha") ||
+                texto.contains("día es hoy") -> {
+                respuesta = "Hoy es " +
+                    SimpleDateFormat(
+                        "EEEE d 'de' MMMM 'de' yyyy",
+                        Locale("es", "MX")
+                    ).format(Date())
+            }
+
+            texto.contains("youtube") -> {
+                abrirUrl("https://www.youtube.com")
+                respuesta = "Abriendo YouTube."
+            }
+
+            texto.contains("google") ||
+                texto.contains("busca en internet") -> {
+                val consulta = texto
+                    .replace("busca en internet", "")
+                    .replace("google", "")
+                    .trim()
+
+                val url = if (consulta.isBlank()) {
+                    "https://www.google.com"
+                } else {
+                    "https://www.google.com/search?q=" +
+                        Uri.encode(consulta)
+                }
+
+                abrirUrl(url)
+                respuesta = if (consulta.isBlank()) {
+                    "Abriendo Google."
+                } else {
+                    "Buscando $consulta en Google."
+                }
+            }
+
+            texto.contains("whatsapp") -> {
+                val intent = packageManager
+                    .getLaunchIntentForPackage("com.whatsapp")
+
+                if (intent != null) {
+                    startActivity(intent)
+                    respuesta = "Abriendo WhatsApp."
+                } else {
+                    abrirUrl("https://www.whatsapp.com/")
+                    respuesta = "Abriendo la página de WhatsApp."
+                }
+            }
+
+            texto.startsWith("llama a ") ||
+                texto.startsWith("llamar a ") -> {
+                val numero = texto.filter { it.isDigit() }
+
+                if (numero.length >= 7) {
+                    val intent = Intent(
+                        Intent.ACTION_DIAL,
+                        Uri.parse("tel:$numero")
+                    )
+                    startActivity(intent)
+                    respuesta = "Abriendo el marcador para $numero."
+                } else {
+                    respuesta = "Dime un número telefónico válido."
+                }
+            }
+
+            texto.startsWith("mensaje a ") -> {
+                val numero = texto.filter { it.isDigit() }
+
+                if (numero.length >= 7) {
+                    val intent = Intent(
+                        Intent.ACTION_SENDTO,
+                        Uri.parse("smsto:$numero")
+                    )
+                    startActivity(intent)
+                    respuesta = "Abriendo mensajes para $numero."
+                } else {
+                    respuesta = "Dime el número al que quieres escribir."
+                }
+            }
+
+            texto.contains("cómo estás") ||
+                texto.contains("como estas") -> {
+                respuesta = "Todos mis sistemas están listos."
+            }
+
+            texto == "hola" ||
+                texto.contains("hola héctor") ||
+                texto.contains("hola hector") -> {
+                respuesta = "Hola. Soy HÉCTOR. ¿Qué necesitas?"
+            }
+
+            texto.contains("ayuda") ||
+                texto.contains("qué puedes hacer") ||
+                texto.contains("que puedes hacer") -> {
+                respuesta = "Puedo consultar la hora y la fecha, " +
+                    "abrir YouTube, Google y WhatsApp, " +
+                    "preparar llamadas y abrir mensajes."
+            }
+
+            else -> {
+                respuesta = "Todavía no tengo una acción para esa orden. " +
+                    "Prueba decir ayuda o busca en internet seguido de tu consulta."
+            }
+        }
+
+        decir(respuesta)
+        return respuesta
+    }
+
+    private fun abrirUrl(url: String) {
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            )
+        } catch (_: ActivityNotFoundException) {
+            decir("No encontré una aplicación para abrir ese enlace.")
+        }
+    }
+
+    override fun onDestroy() {
+        recognizer?.destroy()
+        tts?.stop()
+        tts?.shutdown()
+        super.onDestroy()
+    }
+}
+
+@Composable
+fun HectorApp(
+    escuchar: ((String) -> Unit) -> Unit,
+    ejecutar: (String) -> String,
+    hablar: (String) -> Unit
+) {
+    var comando by remember { mutableStateOf("") }
+    var respuesta by remember {
+        mutableStateOf("Sistemas listos. Esperando instrucciones.")
+    }
+    var escuchando by remember { mutableStateOf(false) }
+
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Azul,
+            background = Fondo,
+            surface = Panel
+        )
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Fondo
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(20.dp)
+            ) {
+                Spacer(Modifier.height(20.dp))
+
+                Text(
+                    "H É C T O R",
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Azul
+                )
+
+                Text(
+                    "ASISTENTE PERSONAL • ANDROID",
+                    fontSize = 11.sp,
+                    color = Color.LightGray
+                )
+
+                Spacer(Modifier.height(20.dp))
+
+                Box(
+                    modifier = Modifier
+                        .size(190.dp)
+                        .background(Panel, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        modifier = Modifier.size(145.dp),
+                        shape = CircleShape,
+                        color = Fondo,
+                        border = androidx.compose.foundation.BorderStroke(
+                            2.dp, Azul
+                        )
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(
+                                if (escuchando) "●" else "H",
+                                color = Azul,
+                                fontSize = 62.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
+                Text(
+                    if (escuchando) "ESCUCHANDO..." else "EN LÍNEA",
+                    color = Azul,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Surface(
+                    color = Panel,
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Text(
+                        respuesta,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(18.dp),
+                        color = Color.White,
+                        fontSize = 16.sp
+                    )
+                }
+
+                OutlinedTextField(
+                    value = comando,
+                    onValueChange = { comando = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Escribe una instrucción") },
+                    placeholder = {
+                        Text("Ej.: abre YouTube")
+                    },
+                    singleLine = true
+                )
+
+                Button(
+                    onClick = {
+                        if (comando.isNotBlank()) {
+                            respuesta = ejecutar(comando)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("EJECUTAR ORDEN")
+                }
+
+                Button(
+                    onClick = {
+                        escuchando = true
+                        escuchar { texto ->
+                            comando = texto
+                            respuesta = ejecutar(texto)
+                            escuchando = false
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(58.dp)
+                ) {
+                    Text("🎙 HABLAR CON HÉCTOR")
+                }
+
+                Text(
+                    "Di: hora, fecha, abre YouTube, " +
+                        "abre WhatsApp o ayuda.",
+                    color = Color.Gray,
+                    fontSize = 12.sp
+                )
+            }
+        }
+    }
+}

@@ -14,6 +14,7 @@ IMPORTANTE:
 
 import io
 import json
+import math
 import os
 import re
 import uuid
@@ -21,7 +22,7 @@ import zipfile
 import urllib.parse
 import html
 import base64
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -37,7 +38,8 @@ except ImportError:
 
 try:
     import openpyxl
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
     OPENPYXL_OK = True
 except ImportError:
     OPENPYXL_OK = False
@@ -145,12 +147,6 @@ div[data-testid="stAlert"] {
   color: #E8F3EC;
   padding: 4px 10px;
   border-radius: 6px;
-  font-size: 12px;
-  font-weight: 700;
-  display: inline-block;
-  letter-spacing: 0.5px;
-}
-
 /* Presentación formal y elegante - Tipografía institucional */
 h1, h2, h3 {
   font-family: Georgia, "Palatino Linotype", "Times New Roman", serif !important;
@@ -211,7 +207,6 @@ st.markdown(CSS_INSTITUCIONAL, unsafe_allow_html=True)
 
 def encabezado_institucional(titulo, badge="", subtitulo=""):
     """Encabezado formal uniforme para todas las pestañas del sistema institucional."""
-    insignia = f'<div class="clubpark-badge" style="margin-top:2px">{badge}</div>' if badge else ""
     sub = f'<div style="font-size:13px;color:#EBF3EE;margin-top:2px">{subtitulo}</div>' if subtitulo else ""
     st.markdown(
         f"""<div class="clubpark-header-card">
@@ -249,7 +244,7 @@ PRECIOS_SUCURSALES = {
     "CARAJILLO POLANCO": 100,
     "BENINGAN´S": 40,
     "SANATORIO DURANGO": 100,
-    "BARRANCA": 0,
+    "BARRANCA": 25,  # solo base (1ª hora); el cobro real sale de TARIFAS (tiempo / promoción)
     "VETERINARIA": 0,
     "ROMANCE PALACE": 65,
     "JUNGLA TLALPAN": 100,
@@ -268,6 +263,142 @@ PRECIOS_SUCURSALES = {
 }
 SUCURSALES = sorted(PRECIOS_SUCURSALES)
 
+# ---------------------------------------------------------------------
+# TARIFAS CONFIGURABLES POR SUCURSAL
+# tipo "fija": cobra siempre el mismo precio (ej. $50).
+# tipo "tiempo": 1ª hora + bloques de N minutos (ej. $25 + $7 c/15 min).
+# promo_activa: ofrece además una promoción (ej. $80 por 10 horas).
+# El Contador puede cambiar todo esto en la pestaña "💲 Tarifas".
+# ---------------------------------------------------------------------
+TARIFAS_FILE = DATA_DIR / "tarifas_config.json"
+_TARIFA_BASE = {
+    "tipo": "fija", "precio_fijo": 0.0,
+    "primera_hora": 25.0, "bloque_min": 15, "precio_bloque": 7.0,
+    "promo_activa": False, "promo_precio": 80.0, "promo_horas": 10,
+}
+ETIQUETAS_MODALIDAD = {"fija": "Tarifa fija", "tiempo": "Normal por tiempo", "promocion": "Promoción"}
+
+
+def tarifas_por_defecto():
+    tarifas = {suc: dict(_TARIFA_BASE, precio_fijo=float(precio)) for suc, precio in PRECIOS_SUCURSALES.items()}
+    tarifas["BARRANCA"] = dict(_TARIFA_BASE, tipo="tiempo", precio_fijo=0.0, promo_activa=True)
+    return tarifas
+
+
+def cargar_tarifas():
+    tarifas = tarifas_por_defecto()
+    if TARIFAS_FILE.exists():
+        try:
+            guardadas = json.loads(TARIFAS_FILE.read_text(encoding="utf-8"))
+            if isinstance(guardadas, dict):
+                for suc, cfg in guardadas.items():
+                    if suc in tarifas and isinstance(cfg, dict):
+                        tarifas[suc].update({k: v for k, v in cfg.items() if k in _TARIFA_BASE})
+        except (OSError, ValueError):
+            pass
+    return tarifas
+
+
+def guardar_tarifas(tarifas):
+    temporal = TARIFAS_FILE.with_suffix(".tmp")
+    temporal.write_text(json.dumps(tarifas, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporal, TARIFAS_FILE)
+
+
+def tarifa_de(sucursal):
+    return cargar_tarifas().get(sucursal) or dict(_TARIFA_BASE, precio_fijo=float(PRECIOS_SUCURSALES.get(sucursal, 50)))
+
+
+def modalidades_disponibles(cfg):
+    if cfg.get("tipo") == "tiempo":
+        return ["tiempo", "promocion"] if cfg.get("promo_activa") else ["tiempo"]
+    return ["fija"]
+
+
+def etiqueta_modalidad(cfg, modalidad):
+    if modalidad == "promocion":
+        return f"Promoción ${float(cfg['promo_precio']):,.0f} por {int(cfg['promo_horas'])} h"
+    if modalidad == "tiempo":
+        return (f"Normal: ${float(cfg['primera_hora']):,.0f} la 1ª hora + "
+                f"${float(cfg['precio_bloque']):,.0f} cada {int(cfg['bloque_min'])} min")
+    return f"Tarifa fija ${float(cfg['precio_fijo']):,.0f}"
+
+
+def precio_inicial(cfg, modalidad):
+    if modalidad == "promocion":
+        return float(cfg["promo_precio"])
+    if modalidad == "tiempo":
+        return float(cfg["primera_hora"])
+    return float(cfg["precio_fijo"])
+
+
+def _cobro_tiempo(cfg, minutos):
+    primera = float(cfg["primera_hora"])
+    if minutos <= 60:
+        return primera
+    bloque = max(1, int(cfg["bloque_min"]))
+    return primera + math.ceil((minutos - 60) / bloque) * float(cfg["precio_bloque"])
+
+
+def calcular_cobro(cfg, modalidad, minutos, precio_registrado=None):
+    """Importe a cobrar. Cada fracción de bloque iniciada se cobra completa."""
+    minutos = max(0, int(minutos or 0))
+    if modalidad == "promocion":
+        base = float(cfg["promo_precio"])
+        limite = int(cfg["promo_horas"]) * 60
+        if minutos > limite:  # pasadas las horas de la promo se cobran bloques extra
+            bloque = max(1, int(cfg["bloque_min"]))
+            base += math.ceil((minutos - limite) / bloque) * float(cfg["precio_bloque"])
+        return base
+    if modalidad == "tiempo":
+        return _cobro_tiempo(cfg, minutos)
+    return float(precio_registrado) if precio_registrado is not None else float(cfg["precio_fijo"])
+
+
+def minutos_estancia(registro, fin=None):
+    fin = fin or datetime.now()
+    entrada = None
+    iso = registro.get("fecha_entrada_iso")
+    if iso:
+        try:
+            entrada = datetime.fromisoformat(iso)
+        except ValueError:
+            entrada = None
+    if entrada is None:
+        for valor in (registro.get("fecha_entrada"), registro.get("fecha")):
+            for formato in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    entrada = datetime.strptime(str(valor or ""), formato)
+                    break
+                except ValueError:
+                    continue
+            if entrada:
+                break
+    if entrada is None:
+        return 0
+    return max(0, int((fin - entrada).total_seconds() // 60))
+
+
+def texto_duracion(minutos):
+    return f"{minutos // 60} h {minutos % 60} min"
+
+
+def lineas_tarifa_ticket(sucursal, modalidad):
+    """Texto de tarifas del ticket de salida. Sucursales fijas conservan el texto original."""
+    cfg = tarifa_de(sucursal)
+    if cfg.get("tipo") == "tiempo" or modalidad == "promocion":
+        if modalidad == "promocion":
+            return [f"PROMOCION ${float(cfg['promo_precio']):,.2f} POR {int(cfg['promo_horas'])} HORAS.",
+                    f"Excedente: ${float(cfg['precio_bloque']):,.2f} cada {int(cfg['bloque_min'])} min."]
+        return [f"BIENVENIDO. Primera hora ${float(cfg['primera_hora']):,.2f}.",
+                f"Despues: ${float(cfg['precio_bloque']):,.2f} cada {int(cfg['bloque_min'])} min",
+                "(fraccion iniciada se cobra)."]
+    return ["BIENVENIDO. Primera hora $25.00.",
+            "A partir de la segunda hora, aplican",
+            "tarifas por fraccion: 15 min $10.00",
+            "los primeros 15, posteriores $5.00."]
+
+
 # Tokens de ejemplo: reemplázalos por secretos/variables de entorno en producción.
 # Si defines CLUBPARK_TOKENS_JSON, debe contener un objeto JSON con el mismo formato.
 TOKENS_POR_DEFECTO = {
@@ -281,7 +412,7 @@ TOKENS_POR_DEFECTO = {
         "sucursal": "TODAS",
         "rol": "Supervisor Global",
     },
-    "CPV-GLOBAL-VICTOR-2026": {
+        "CPV-GLOBAL-VICTOR-2026": {
         "nombre": "Víctor Manuel",
         "sucursal": "TODAS",
         "rol": "Supervisor Global",
@@ -738,7 +869,7 @@ def vista_impresion_con_qr(registro, parte="cliente", key="print_qr"):
         </a>
       </div>
       <div id="status_{safe_key}" style="margin-top:6px;font-size:12px;color:#4A6B56">
-        El botón verde usa el diálogo de impresión del navegador (impresoras de red o servicio Mopria). Para una impresora térmica <b>Bluetooth</b> como la MP210 (58 mm), usa los botones RawBT del panel de impresión Bluetooth de abajo.
+                El botón verde usa el diálogo de impresión del navegador (impresoras de red o servicio Mopria). Para una impresora térmica <b>Bluetooth</b> como la MP210 (58 mm), usa los botones RawBT del panel de impresión Bluetooth de abajo.
       </div>
       <div id="ticket_html_{safe_key}" style="display:none">{seguro}</div>
     </div>
@@ -1433,7 +1564,7 @@ def leer_codigo_qr(imagen_pil):
             arr = np.array(gris)
             _, otsu = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             candidatos.append(Image.fromarray(otsu))
-            candidatos.append(Image.fromarray(cv2.adaptiveThreshold(
+                        candidatos.append(Image.fromarray(cv2.adaptiveThreshold(
                 arr, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 2)))
         except Exception:
             pass
@@ -1849,7 +1980,7 @@ def analisis_inteligente(registros):
         if h >= 12:
             alertas.append({"tipo": "🚨 Estancia crítica", "sucursal": suc, "detalle": f"{ident} ({placas}) en {suc}: {h:.1f} h sin salida", "accion": "Verificar con el encargado y registrar salida o incidencia hoy."})
         elif h >= 6:
-            alertas.append({"tipo": "⚠️ Estancia prolongada", "sucursal": suc, "detalle": f"{ident} ({placas}) en {suc}: {h:.1f} h", "accion": "Dar seguimiento en la próxima revisión."})
+                        alertas.append({"tipo": "⚠️ Estancia prolongada", "sucursal": suc, "detalle": f"{ident} ({placas}) en {suc}: {h:.1f} h", "accion": "Dar seguimiento en la próxima revisión."})
     placas_activas = {}
     for r in activos:
         clave = normalizar_texto(r.get("placas")).upper()
@@ -1902,7 +2033,821 @@ def analisis_inteligente(registros):
     return kpis, alertas, resumen, recomendaciones
 
 
-tab_ing, tab_list, tab_salida, tab_balance, tab_imp, tab_rep, tab_corte, tab_cierre_diario, tab_aud, tab_qrs, tab_pruebas, tab_intel = st.tabs([
+
+# =====================================================================
+# REPORTES FÍSICOS (ingresos / gastos) + EXCEL OFICIAL DE FLUJO
+# (Integrado desde la app de reporte de flujo diario por sitio.)
+# =====================================================================
+CATALOGO_OFICIAL_23 = [
+    {"num": 1, "sitio": "PAMPAS INSURGENTES", "dias": "LUNES A DOMINGO", "horarios": "11:30 AM A 12:00 PM", "empleados": 5, "supervisor": "JESÚS", "tarifa": 50},
+    {"num": 2, "sitio": "PAMPAS COAPA", "dias": "LUNES A DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 50},
+    {"num": 3, "sitio": "RAMMA", "dias": "LUNES A DOMINGO", "horarios": "12:00 PM A 02:00 AM", "empleados": 2, "supervisor": "JESÚS", "tarifa": 70},
+    {"num": 4, "sitio": "SUSHITTO", "dias": "LUNES A DOMINGO", "horarios": "01:00 PM A 08:00 PM", "empleados": 1, "supervisor": "JESÚS", "tarifa": 40},
+    {"num": 5, "sitio": "CARAJILLO POLANCO", "dias": "LUNES A DOMINGO", "horarios": "01:00 PM A 01:00 AM", "empleados": 2, "supervisor": "JESÚS", "tarifa": 100},
+    {"num": 6, "sitio": "BENINGAN´S", "dias": "LUNES A DOMINGO", "horarios": "12:00 PM A 09:00 PM", "empleados": 2, "supervisor": "JESÚS", "tarifa": 40},
+    {"num": 7, "sitio": "SANATORIO DURANGO", "dias": "LUNES A DOMINGO", "horarios": "12:00 PM A 09:00 PM", "empleados": 4, "supervisor": "JESÚS", "tarifa": 100},
+    {"num": 8, "sitio": "BARRANCA", "dias": "LUNES A VIERNES", "horarios": "08:00 AM A 08:00 PM", "empleados": 2, "supervisor": "JESÚS", "tarifa": 0},
+    {"num": 9, "sitio": "VETERINARIA", "dias": "LUNES A DOMINGO", "horarios": "09:00 AM A 19:00 PM", "empleados": 1, "supervisor": "JESÚS", "tarifa": 0},
+    {"num": 10, "sitio": "ROMANCE PALACE", "dias": "VIERNES A DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 65},
+    {"num": 11, "sitio": "JUNGLA TLALPAN", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 100},
+    {"num": 12, "sitio": "JUNGLA DIVISIÓN", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 100},
+    {"num": 13, "sitio": "JUNGLA PICACHO", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 100},
+    {"num": 14, "sitio": "JUNGLA EMPRESA", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 100},
+    {"num": 15, "sitio": "SIPIRILY COAPA", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 80},
+    {"num": 16, "sitio": "MAROMETA SATÉLITE", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 70},
+    {"num": 17, "sitio": "MAROMETA MARINA", "dias": "SÁBADO Y DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "JESÚS", "tarifa": 70},
+    {"num": 18, "sitio": "SUMO STA. MONICA", "dias": "LUNES A DOMINGO", "horarios": "12:30 PM A 11:00 PM", "empleados": 1, "supervisor": "VÍCTOR", "tarifa": 50},
+    {"num": 19, "sitio": "SUMO ECHEGARAY", "dias": "LUNES A DOMINGO", "horarios": "12:30 PM A 11:00 PM", "empleados": 1, "supervisor": "VÍCTOR", "tarifa": 50},
+    {"num": 20, "sitio": "RYOSHI", "dias": "LUNES A DOMINGO", "horarios": "12:00 PM A 1:00 AM", "empleados": 4, "supervisor": "VÍCTOR", "tarifa": 80},
+    {"num": 21, "sitio": "ENCANTO", "dias": "LUNES A DOMINGO", "horarios": "12:30 PM A 01 AM", "empleados": 1, "supervisor": "VÍCTOR", "tarifa": 60},
+    {"num": 22, "sitio": "E-BNI", "dias": "LUNES A DOMINGO", "horarios": "-", "empleados": 0, "supervisor": "VÍCTOR", "tarifa": 50},
+    {"num": 23, "sitio": "CHURRASQUERIA", "dias": "LUNES A DOMINGO", "horarios": "12:30 PM A 11:00 PM", "empleados": 1, "supervisor": "VÍCTOR", "tarifa": 70},
+]
+
+MESES_ESP = {1: "ENE", 2: "FEB", 3: "MAR", 4: "ABR", 5: "MAY", 6: "JUN", 7: "JUL", 8: "AGO", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DIC"}
+DIAS_ESP = {0: "LUNES", 1: "MARTES", 2: "MIERCOLES", 3: "JUEVES", 4: "VIERNES", 5: "SÁBADO", 6: "DOMINGO"}
+
+def normalizar_a_sucursal_oficial(nombre):
+    if not nombre:
+        return "PAMPAS INSURGENTES"
+    n = str(nombre).strip().upper()
+    mapa = {
+        "PAMPAS INS": "PAMPAS INSURGENTES", "PAMPAS COA": "PAMPAS COAPA",
+        "PAMPAS": "PAMPAS INSURGENTES", "RAMMA": "RAMMA", "RAMA": "RAMMA",
+        "SUSHITTO": "SUSHITTO", "SUSH": "SUSHITTO",
+        "CARAJILLO": "CARAJILLO POLANCO", "CARAJ": "CARAJILLO POLANCO",
+        "BENINGANS": "BENINGAN´S", "BENINGAN´S": "BENINGAN´S", "BENI": "BENINGAN´S",
+        "SANATORIO": "SANATORIO DURANGO", "DURANGO": "SANATORIO DURANGO", "CLÍNICA": "SANATORIO DURANGO",
+        "BARRANCA": "BARRANCA", "VETERINARIA": "VETERINARIA",
+        "ROMAS": "ROMANCE PALACE", "ROMANCE": "ROMANCE PALACE",
+        "J.TLALPAN": "JUNGLA TLALPAN", "TLALPAN": "JUNGLA TLALPAN",
+        "J.DIVISION": "JUNGLA DIVISIÓN", "DIVISIÓN": "JUNGLA DIVISIÓN",
+        "J.PICACHO": "JUNGLA PICACHO", "PICACHO": "JUNGLA PICACHO",
+        "J.EMPRESA": "JUNGLA EMPRESA", "EMPRESA": "JUNGLA EMPRESA",
+        "SIPIRILY": "SIPIRILY COAPA", "SIPILY": "SIPIRILY COAPA",
+        "M SATÉLITE": "MAROMETA SATÉLITE", "SATÉLITE": "MAROMETA SATÉLITE",
+        "M MARINA": "MAROMETA MARINA", "MARINA": "MAROMETA MARINA",
+        "SUMO STA": "SUMO STA. MONICA", "MONICA": "SUMO STA. MONICA",
+        "CHEGARAY": "SUMO ECHEGARAY", "ECHEGARAY": "SUMO ECHEGARAY",
+        "RYOSHI": "RYOSHI", "RYO": "RYOSHI", "ENCANTO": "ENCANTO", "ENCANT": "ENCANTO",
+        "E-BNI": "E-BNI", "CHURRASCA": "CHURRASQUERIA", "CHURRASQUERIA": "CHURRASQUERIA"
+    }
+    for k, v in mapa.items():
+        if k in n:
+            return v
+    return n
+
+def generar_excel_formato_oficial(registros, etiqueta_periodo="SEMANAL"):
+    """Genera el libro oficial idéntico a CONTROL_FLUJO_DIARIO: hojas DETALLE, CONCENTRADO X DÍA y Rentabilidad."""
+    wb = openpyxl.Workbook()
+    ws_det = wb.active
+    ws_det.title = "DETALLE "
+    ws_conc = wb.create_sheet(title="CONCENTRADO X DÍA")
+    ws_aud = wb.create_sheet(title="Rentabilidad y Auditoría")
+
+    fill_green = PatternFill(start_color="003300", end_color="003300", fill_type="solid")
+    font_title = Font(name="Calibri", size=15, bold=True, color="003300")
+    font_subtitle = Font(name="Calibri", size=11, bold=True, color="000000")
+    font_head = Font(name="Calibri", size=8, bold=True, color="FFFFFF")
+    font_bold = Font(name="Calibri", size=8, bold=True, color="000000")
+    font_data = Font(name="Calibri", size=8, color="000000")
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin", color="B2B2B2"),
+        right=Side(style="thin", color="B2B2B2"),
+        top=Side(style="thin", color="B2B2B2"),
+        bottom=Side(style="thin", color="B2B2B2")
+    )
+
+    fechas_dt = []
+    for r in registros:
+        f_str = r.get("Fecha")
+        if f_str:
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                try:
+                    fechas_dt.append(datetime.strptime(f_str, fmt).date())
+                    break
+                except ValueError:
+                    pass
+
+    if fechas_dt:
+        fechas_unicas = sorted(list(set(fechas_dt)))
+        if len(fechas_unicas) <= 7:
+            min_d = fechas_unicas[0]
+            lunes = min_d - timedelta(days=min_d.weekday())
+            dias_periodo = [lunes + timedelta(days=i) for i in range(7)]
+        else:
+            dias_periodo = fechas_unicas
+    else:
+        hoy = date.today()
+        lunes = hoy - timedelta(days=hoy.weekday())
+        dias_periodo = [lunes + timedelta(days=i) for i in range(7)]
+
+    txt_periodo = f"CORTE {dias_periodo[0].strftime('%d/%m/%Y')} AL {dias_periodo[-1].strftime('%d/%m/%Y')} ({etiqueta_periodo.upper()})"
+
+    matriz_reg = {}
+    for r in registros:
+        f_str = r.get("Fecha")
+        d_obj = None
+        if f_str:
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                try:
+                    d_obj = datetime.strptime(f_str, fmt).date()
+                    break
+                except ValueError:
+                    pass
+        if d_obj:
+            suc_norm = normalizar_a_sucursal_oficial(r.get("Sitio / Unidad"))
+            key = (suc_norm, d_obj)
+            matriz_reg[key] = r
+
+    # --- HOJA 1: DETALLE ---
+    ws_det["A1"] = "CLUB PARK VALET Y ESTACIONAMIENTOS, S.A. DE C.V."
+    ws_det["A1"].font = font_title
+    ws_det["A3"] = txt_periodo
+    ws_det["A3"].font = font_subtitle
+    ws_det["A5"] = "INGRESOS POR PERÍODO"
+    ws_det["A5"].font = font_subtitle
+
+    meta_headers = ["No.", "SITIO", "DÍAS QUE SE OPERA", "HORARIOS", "No. EMPLEADOS", "SUPERVISOR"]
+    for i, h in enumerate(meta_headers, start=1):
+        cell = ws_det.cell(8, i, h)
+        cell.fill = fill_green; cell.font = font_head; cell.alignment = align_center; cell.border = thin_border
+        ws_det.merge_cells(start_row=8, start_column=i, end_row=10, end_column=i)
+
+    col_idx = 7
+    dia_cols_map = {}
+    for d in dias_periodo:
+        d_str = f"{DIAS_ESP[d.weekday()]} {d.day:02d}/{MESES_ESP[d.month]}/{d.year}"
+        dia_cols_map[d] = col_idx
+        c8 = ws_det.cell(8, col_idx, d_str)
+        c8.fill = fill_green; c8.font = font_head; c8.alignment = align_center
+        ws_det.merge_cells(start_row=8, start_column=col_idx, end_row=8, end_column=col_idx+4)
+        for c in range(col_idx, col_idx+5):
+            ws_det.cell(8, c).fill = fill_green; ws_det.cell(8, c).border = thin_border
+
+        ws_det.cell(9, col_idx, "CONSECUTIVO BOLETAJE").fill = fill_green
+        ws_det.cell(9, col_idx).font = font_head; ws_det.cell(9, col_idx).alignment = align_center
+        ws_det.merge_cells(start_row=9, start_column=col_idx, end_row=9, end_column=col_idx+1)
+        ws_det.cell(9, col_idx+1).fill = fill_green
+
+        c_tb = ws_det.cell(9, col_idx+2, "TOTAL DE BOLETOS")
+        c_tb.fill = fill_green; c_tb.font = font_head; c_tb.alignment = align_center
+        ws_det.merge_cells(start_row=9, start_column=col_idx+2, end_row=10, end_column=col_idx+2)
+
+        c_cb = ws_det.cell(9, col_idx+3, "COSTO X BOLETO")
+        c_cb.fill = fill_green; c_cb.font = font_head; c_cb.alignment = align_center
+        ws_det.merge_cells(start_row=9, start_column=col_idx+3, end_row=10, end_column=col_idx+3)
+
+        c_ing = ws_det.cell(9, col_idx+4, "INGRESO POR DÍA")
+        c_ing.fill = fill_green; c_ing.font = font_head; c_ing.alignment = align_center
+        ws_det.merge_cells(start_row=9, start_column=col_idx+4, end_row=10, end_column=col_idx+4)
+
+        c_fi = ws_det.cell(10, col_idx, "FOLIO INICIAL")
+        c_fi.fill = fill_green; c_fi.font = font_head; c_fi.alignment = align_center
+        c_ff = ws_det.cell(10, col_idx+1, "FOLIO FINAL")
+        c_ff.fill = fill_green; c_ff.font = font_head; c_ff.alignment = align_center
+
+        for r_h in [9, 10]:
+            for c_h in range(col_idx, col_idx+5):
+                ws_det.cell(r_h, c_h).border = thin_border
+        col_idx += 5
+
+    col_tot_bol = col_idx
+    col_tot_ing = col_idx + 1
+    c_tbl = ws_det.cell(8, col_tot_bol, "TOTAL DE BOLETOS UTILIZADOS X PERÍODO")
+    c_tbl.fill = fill_green; c_tbl.font = font_head; c_tbl.alignment = align_center; c_tbl.border = thin_border
+    ws_det.merge_cells(start_row=8, start_column=col_tot_bol, end_row=10, end_column=col_tot_bol)
+
+    c_tin = ws_det.cell(8, col_tot_ing, "TOTAL DE INGRESOS X PERÍODO")
+    c_tin.fill = fill_green; c_tin.font = font_head; c_tin.alignment = align_center; c_tin.border = thin_border
+    ws_det.merge_cells(start_row=8, start_column=col_tot_ing, end_row=10, end_column=col_tot_ing)
+
+    r_actual = 11
+    fila_inicio_ing = r_actual
+    for item in CATALOGO_OFICIAL_23:
+        ws_det.cell(r_actual, 1, item["num"]).alignment = align_center
+        ws_det.cell(r_actual, 2, item["sitio"]).alignment = align_left
+        ws_det.cell(r_actual, 3, item["dias"]).alignment = align_left
+        ws_det.cell(r_actual, 4, item["horarios"]).alignment = align_center
+        ws_det.cell(r_actual, 5, item["empleados"]).alignment = align_center
+        ws_det.cell(r_actual, 6, item["supervisor"]).alignment = align_center
+
+        for ci in range(1, 7):
+            cell = ws_det.cell(r_actual, ci)
+            cell.font = font_data; cell.border = thin_border
+
+        tot_bol_suc = 0
+        tot_ing_suc = 0.0
+        for d in dias_periodo:
+            c_d = dia_cols_map[d]
+            rep = matriz_reg.get((item["sitio"], d))
+            if rep:
+                f_ini = rep.get("Folio Inicial", 0)
+                f_fin = rep.get("Folio Final", 0)
+                bol = rep.get("Boletos Cobrados", rep.get("Total Boletos", 0))
+                costo = rep.get("Costo Boleto", item["tarifa"])
+                ing = rep.get("Ingreso Bruto", float(bol) * float(costo))
+            else:
+                f_ini = 0; f_fin = 0; bol = 0; costo = item["tarifa"]; ing = 0.0
+
+            ws_det.cell(r_actual, c_d, f_ini).alignment = align_center
+            ws_det.cell(r_actual, c_d+1, f_fin).alignment = align_center
+            ws_det.cell(r_actual, c_d+2, bol).alignment = align_center
+            ws_det.cell(r_actual, c_d+3, costo).alignment = align_right
+            ws_det.cell(r_actual, c_d+3).number_format = "$#,##0.00"
+            ws_det.cell(r_actual, c_d+4, ing).alignment = align_right
+            ws_det.cell(r_actual, c_d+4).number_format = "$#,##0.00"
+
+            tot_bol_suc += bol
+            tot_ing_suc += ing
+
+            for c_sub in range(c_d, c_d+5):
+                cell = ws_det.cell(r_actual, c_sub)
+                cell.font = font_data; cell.border = thin_border
+
+        c_tb_cell = ws_det.cell(r_actual, col_tot_bol, tot_bol_suc)
+        c_tb_cell.alignment = align_center; c_tb_cell.font = font_bold; c_tb_cell.border = thin_border
+        c_ti_cell = ws_det.cell(r_actual, col_tot_ing, tot_ing_suc)
+        c_ti_cell.alignment = align_right; c_ti_cell.font = font_bold; c_ti_cell.border = thin_border
+        c_ti_cell.number_format = "$#,##0.00"
+        r_actual += 1
+
+        fila_fin_gas = r_actual_g - 1
+
+    r_tot_gas = r_actual_g
+    ws_det.cell(r_tot_gas, 2, "TOTAL").font = font_bold
+    for ci in range(1, col_tot_ing + 1):
+        ws_det.cell(r_tot_gas, ci).border = thin_border
+
+    for d in dias_periodo:
+        c_d = dia_cols_map[d]
+        col_let_gas = get_column_letter(c_d+4)
+        c_sg = ws_det.cell(r_tot_gas, c_d+4, f"=SUM({col_let_gas}{fila_inicio_gas}:{col_let_gas}{fila_fin_gas})")
+        c_sg.font = font_bold; c_sg.alignment = align_right; c_sg.number_format = "$#,##0.00"
+
+    ws_det.cell(r_tot_gas, col_tot_bol, f"=SUM({get_column_letter(col_tot_bol)}{fila_inicio_gas}:{get_column_letter(col_tot_bol)}{fila_fin_gas})").font = font_bold
+    ws_det.cell(r_tot_gas, col_tot_bol).alignment = align_right
+    ws_det.cell(r_tot_gas, col_tot_bol).number_format = "$#,##0.00"
+    ws_det.merge_cells(start_row=r_tot_gas, start_column=col_tot_bol, end_row=r_tot_gas, end_column=col_tot_ing)
+
+    r_util = r_tot_gas + 2
+    ws_det.cell(r_util, 2, "UTILIDAD O PÉRDIDA X DÍA").font = font_bold
+    for ci in range(1, col_tot_ing + 1):
+        ws_det.cell(r_util, ci).border = thin_border
+
+    for d in dias_periodo:
+        c_d = dia_cols_map[d]
+        let_ing = get_column_letter(c_d+4)
+        c_ut = ws_det.cell(r_util, c_d+4, f"=+{let_ing}{r_tot_ing}-{let_ing}{r_tot_gas}")
+        c_ut.font = font_bold; c_ut.alignment = align_right; c_ut.number_format = "$#,##0.00"
+
+    c_ut_tot = ws_det.cell(r_util, col_tot_bol, f"=+{get_column_letter(col_tot_ing)}{r_tot_ing}-{get_column_letter(col_tot_bol)}{r_tot_gas}")
+    c_ut_tot.font = font_bold; c_ut_tot.alignment = align_right; c_ut_tot.number_format = "$#,##0.00"
+    ws_det.merge_cells(start_row=r_util, start_column=col_tot_bol, end_row=r_util, end_column=col_tot_ing)
+
+    # --- HOJA 2: CONCENTRADO X DÍA ---
+    ws_conc["A1"] = "CLUB PARK VALET Y ESTACIONAMIENTOS, S.A. DE C.V."
+    ws_conc["A1"].font = font_title
+    ws_conc["A2"] = txt_periodo
+    ws_conc["A2"].font = font_subtitle
+    ws_conc["A3"] = "CONCENTRADO DE INGRESOS Y GASTOS"
+    ws_conc["A3"].font = font_subtitle
+
+    for i, h in enumerate(["No.", "SITIO", "SUPERVISOR"], start=1):
+        cell = ws_conc.cell(5, i, h)
+        cell.fill = fill_green; cell.font = font_head; cell.alignment = align_center; cell.border = thin_border
+        ws_conc.merge_cells(start_row=5, start_column=i, end_row=6, end_column=i)
+
+    c_col_conc = 4
+    conc_dia_cols = {}
+    for d in dias_periodo:
+        conc_dia_cols[d] = c_col_conc
+        d_str = f"{DIAS_ESP[d.weekday()]} {d.day:02d}/{MESES_ESP[d.month]}/{d.year}"
+        cell = ws_conc.cell(5, c_col_conc, d_str)
+        cell.fill = fill_green; cell.font = font_head; cell.alignment = align_center
+        ws_conc.merge_cells(start_row=5, start_column=c_col_conc, end_row=5, end_column=c_col_conc+2)
+        for c in range(c_col_conc, c_col_conc+3):
+            ws_conc.cell(5, c).fill = fill_green; ws_conc.cell(5, c).border = thin_border
+
+        for s_i, s_txt in enumerate(["TOTAL INGRESOS X DÍA", "TOTAL GASTOS X DÍA", "UTILIDAD O PÉRDIDA X DÍA"]):
+            sc = ws_conc.cell(6, c_col_conc+s_i, s_txt)
+            sc.fill = fill_green; sc.font = font_head; sc.alignment = align_center; sc.border = thin_border
+        c_col_conc += 3
+
+    col_conc_tot_ing = c_col_conc
+    col_conc_tot_gas = c_col_conc + 1
+    col_conc_tot_ut = c_col_conc + 2
+
+    c_ct = ws_conc.cell(5, col_conc_tot_ing, "CONCENTRADO DEL PERÍODO")
+    c_ct.fill = fill_green; c_ct.font = font_head; c_ct.alignment = align_center
+    ws_conc.merge_cells(start_row=5, start_column=col_conc_tot_ing, end_row=5, end_column=col_conc_tot_ut)
+    for c in range(col_conc_tot_ing, col_conc_tot_ut+1):
+        ws_conc.cell(5, c).fill = fill_green; ws_conc.cell(5, c).border = thin_border
+
+    for s_i, s_txt in enumerate(["TOTAL INGRESOS", "TOTAL GASTOS", "UTILIDAD O PÉRDIDA"]):
+        sc = ws_conc.cell(6, col_conc_tot_ing+s_i, s_txt)
+        sc.fill = fill_green; sc.font = font_head; sc.alignment = align_center; sc.border = thin_border
+
+    r_c_act = 8
+    fila_inicio_c = r_c_act
+    for i_suc, item in enumerate(CATALOGO_OFICIAL_23):
+        ws_conc.cell(r_c_act, 1, item["num"]).alignment = align_center
+        ws_conc.cell(r_c_act, 2, item["sitio"]).alignment = align_left
+        ws_conc.cell(r_c_act, 3, item["supervisor"]).alignment = align_center
+        for ci in range(1, 4):
+            ws_conc.cell(r_c_act, ci).font = font_data; ws_conc.cell(r_c_act, ci).border = thin_border
+
+        fila_det_ing = fila_inicio_ing + i_suc
+        fila_det_gas = fila_inicio_gas + i_suc
+
+        for d in dias_periodo:
+            cd_conc = conc_dia_cols[d]
+            cd_det = dia_cols_map[d]
+            let_ing = get_column_letter(cd_det+4)
+            let_gas = get_column_letter(cd_det+4)
+
+            ws_conc.cell(r_c_act, cd_conc, f"='DETALLE '!{let_ing}{fila_det_ing}").number_format = "$#,##0.00"
+            ws_conc.cell(r_c_act, cd_conc+1, f"='DETALLE '!{let_gas}{fila_det_gas}").number_format = "$#,##0.00"
+            let_ci = get_column_letter(cd_conc)
+            let_cg = get_column_letter(cd_conc+1)
+            ws_conc.cell(r_c_act, cd_conc+2, f"=+{let_ci}{r_c_act}-{let_cg}{r_c_act}").number_format = "$#,##0.00"
+
+            for sub_c in range(cd_conc, cd_conc+3):
+                cell = ws_conc.cell(r_c_act, sub_c)
+                cell.font = font_data; cell.alignment = align_right; cell.border = thin_border
+
+        let_tin_det = get_column_letter(col_tot_ing)
+        let_tga_det = get_column_letter(col_tot_bol)
+        ws_conc.cell(r_c_act, col_conc_tot_ing, f"='DETALLE '!{let_tin_det}{fila_det_ing}").number_format = "$#,##0.00"
+        ws_conc.cell(r_c_act, col_conc_tot_gas, f"='DETALLE '!{let_tga_det}{fila_det_gas}").number_format = "$#,##0.00"
+        let_ti_c = get_column_letter(col_conc_tot_ing)
+        let_tg_c = get_column_letter(col_conc_tot_gas)
+        ws_conc.cell(r_c_act, col_conc_tot_ut, f"=+{let_ti_c}{r_c_act}-{let_tg_c}{r_c_act}").number_format = "$#,##0.00"
+
+        for sub_c in range(col_conc_tot_ing, col_conc_tot_ut+1):
+            cell = ws_conc.cell(r_c_act, sub_c)
+            cell.font = font_bold; cell.alignment = align_right; cell.border = thin_border
+
+        r_c_act += 1
+
+    fila_fin_c = r_c_act - 1
+
+    r_c_tot = r_c_act
+    ws_conc.cell(r_c_tot, 1, "TOTAL").font = font_bold
+    for ci in range(1, col_conc_tot_ut + 1):
+        ws_conc.cell(r_c_tot, ci).border = thin_border
+
+    for d in dias_periodo:
+        cd_conc = conc_dia_cols[d]
+        for sub_i in range(3):
+            col_l = get_column_letter(cd_conc + sub_i)
+            c = ws_conc.cell(r_c_tot, cd_conc + sub_i, f"=SUM({col_l}{fila_inicio_c}:{col_l}{fila_fin_c})")
+            c.font = font_bold; c.alignment = align_right; c.number_format = "$#,##0.00"
+
+    for sub_i in range(3):
+        col_l = get_column_letter(col_conc_tot_ing + sub_i)
+        c = ws_conc.cell(r_c_tot, col_conc_tot_ing + sub_i, f"=SUM({col_l}{fila_inicio_c}:{col_l}{fila_fin_c})")
+        c.font = font_bold; c.alignment = align_right; c.number_format = "$#,##0.00"
+
+    # --- HOJA 3: Rentabilidad y Auditoría ---
+    ws_aud["A1"] = "ANÁLISIS DE RENTABILIDAD Y AUDITORÍA INTELIGENTE"
+    ws_aud["A1"].font = font_title
+    headers_aud = ["ID", "Fecha", "Sitio / Unidad", "Supervisor", "Boletos Cobrados", "Tarifa", "Ingreso Bruto", "Total Gastos", "Ingreso Neto", "Margen (%)", "Estado Auditoría"]
+    for c_i, h in enumerate(headers_aud, start=1):
+        cell = ws_aud.cell(3, c_i, h)
+        cell.fill = fill_green; cell.font = font_head; cell.alignment = align_center; cell.border = thin_border
+
+    r_aud = 4
+    for r in registros:
+        bruto = float(r.get("Ingreso Bruto", 0.0))
+        neto = float(r.get("Ingreso Neto", 0.0))
+        margen = (neto / bruto * 100) if bruto > 0 else 0.0
+        ws_aud.cell(r_aud, 1, r.get("ID", "")).alignment = align_center
+        ws_aud.cell(r_aud, 2, r.get("Fecha", "")).alignment = align_center
+        ws_aud.cell(r_aud, 3, r.get("Sitio / Unidad", "")).alignment = align_left
+        ws_aud.cell(r_aud, 4, r.get("Elaboró", r.get("Usuario", ""))).alignment = align_center
+        ws_aud.cell(r_aud, 5, r.get("Boletos Cobrados", 0)).alignment = align_center
+        ws_aud.cell(r_aud, 6, r.get("Costo Boleto", 0)).number_format = "$#,##0.00"
+        ws_aud.cell(r_aud, 7, bruto).number_format = "$#,##0.00"
+        ws_aud.cell(r_aud, 8, float(r.get("Total Gastos", 0.0))).number_format = "$#,##0.00"
+        ws_aud.cell(r_aud, 9, neto).number_format = "$#,##0.00"
+        ws_aud.cell(r_aud, 10, f"{margen:.1f}%").alignment = align_center
+        ws_aud.cell(r_aud, 11, r.get("Nivel Auditoría", "Conforme")).alignment = align_center
+        for ci in range(1, 12):
+            ws_aud.cell(r_aud, ci).font = font_data; ws_aud.cell(r_aud, ci).border = thin_border
+        r_aud += 1
+
+    # Presentación corporativa: impresión horizontal, títulos legibles y encabezados congelados.
+    for ws in (ws_det, ws_conc, ws_aud):
+        ws.sheet_view.showGridLines = False
+        ws.freeze_panes = "G11" if ws is ws_det else ("D8" if ws is ws_conc else "A4")
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.sheet_properties.pageSetUpPr.autoPageBreaks = False
+        ws.sheet_format.defaultRowHeight = 16
+    for col, width in {"A": 7, "B": 26, "C": 20, "D": 21, "E": 13, "F": 16}.items():
+        ws_det.column_dimensions[col].width = width
+    for c in range(7, col_tot_ing + 1):
+        ws_det.column_dimensions[get_column_letter(c)].width = 14
+    for col, width in {"A": 7, "B": 28, "C": 16}.items():
+        ws_conc.column_dimensions[col].width = width
+    for c in range(4, col_conc_tot_ut + 1):
+        ws_conc.column_dimensions[get_column_letter(c)].width = 18
+    for col, width in {"A": 14, "B": 13, "C": 25, "D": 21, "E": 16, "F": 13, "G": 16, "H": 16, "I": 16, "J": 12, "K": 23}.items():
+        ws_aud.column_dimensions[col].width = width
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+def generar_csv_oficial(registros, etiqueta_periodo="SEMANAL"):
+    """Genera CSV con el esquema oficial corporativo de corte diario por sucursal y supervisor."""
+    if not registros:
+        return "No hay registros disponibles para el período seleccionado.\n".encode("utf-8-sig")
+    
+    filas = []
+    for r in registros:
+        suc = normalizar_a_sucursal_oficial(r.get("Sitio / Unidad", ""))
+        info_cat = next((item for item in CATALOGO_OFICIAL_23 if item["sitio"] == suc), None)
+        dias_op = info_cat["dias"] if info_cat else "-"
+        horarios = info_cat["horarios"] if info_cat else "-"
+        empleados = info_cat["empleados"] if info_cat else 0
+        sup_cat = info_cat["supervisor"] if info_cat else (r.get("Elaboró") or r.get("Usuario") or "JESÚS")
+        
+        bruto = float(r.get("Ingreso Bruto", 0.0))
+        nom = float(r.get("Gastos Generales / Nómina", 0.0))
+        esp = float(r.get("Gastos Especiales", 0.0))
+        tot_g = float(r.get("Total Gastos", nom + esp))
+        neto = float(r.get("Ingreso Neto", bruto - tot_g))
+        
+        filas.append({
+            "No.": info_cat["num"] if info_cat else "",
+            "SITIO": suc,
+            "DÍAS QUE SE OPERA": dias_op,
+            "HORARIOS": horarios,
+            "No. EMPLEADOS": empleados,
+            "SUPERVISOR": sup_cat,
+            "FECHA": r.get("Fecha", ""),
+            "FOLIO INICIAL": r.get("Folio Inicial", 0),
+            "FOLIO FINAL": r.get("Folio Final", 0),
+            "TOTAL BOLETOS": r.get("Boletos Cobrados", r.get("Total Boletos", 0)),
+            "COSTO X BOLETO": r.get("Costo Boleto", info_cat["tarifa"] if info_cat else 0),
+            "INGRESO X DÍA": bruto,
+            "NÓMINA LIDER": nom,
+            "NÓMINA OPERADOR": 0.0,
+            "GASTOS SUPERVISIÓN": 0.0,
+            "VARIOS": esp,
+            "TOTAL GASTOS X DÍA": tot_g,
+            "UTILIDAD O PÉRDIDA X DÍA": neto,
+            "ESTADO AUDITORÍA": r.get("Nivel Auditoría", "Conforme"),
+            "USUARIO REGISTRO": r.get("Usuario") or r.get("Elaboró") or sup_cat
+        })
+    df_csv = pd.DataFrame(filas)
+    return df_csv.to_csv(index=False).encode("utf-8-sig")
+
+
+FISICOS_FILE = DATA_DIR / "reportes_fisicos.json"
+GASTOS_FILE_RF = DATA_DIR / "gastos_operativos.json"
+FOTOS_REPORTES_DIR = DATA_DIR / "fotos_reportes"
+FOTOS_REPORTES_DIR.mkdir(parents=True, exist_ok=True)
+CATEGORIAS_GASTO_RF = ["Nómina", "Renta", "Insumos", "Mantenimiento", "Comisiones", "Servicios", "Otros"]
+
+
+def _leer_lista_json(ruta):
+    if not ruta.exists():
+        return []
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        return datos if isinstance(datos, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _guardar_lista_json(ruta, datos):
+    temporal = ruta.with_suffix(".tmp")
+    temporal.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporal, ruta)
+
+
+def calcular_boletos_block100(f_ini, f_fin):
+    """Conteo inclusivo y cíclico de folios cuyo consecutivo se reinicia cada 100 (595→303 = 9 boletos)."""
+    inicio, fin = int(f_ini), int(f_fin)
+    if inicio < 0 or fin < 0 or (inicio == 0 and fin == 0):
+        return 0
+    return ((fin % 100 - inicio % 100) % 100) + 1
+
+
+def evaluar_rentabilidad(margen):
+    if margen >= 40.0:
+        return "🟢 Alta"
+    if margen >= 15.0:
+        return "🟡 Moderada"
+    if margen > 0.0:
+        return "🟠 Baja"
+    return "🔴 Pérdida"
+
+
+def es_sucursal_directa(sucursal):
+    """Sucursales que reportan ingreso bruto directo, sin control por folio."""
+    cfg = tarifa_de(sucursal)
+    return cfg.get("tipo") == "tiempo" or float(cfg.get("precio_fijo", 0) or 0) == 0 or sucursal == "E-BNI"
+
+
+def fecha_flexible(valor):
+    for formato in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(valor or ""), formato).date()
+        except ValueError:
+            continue
+    return None
+
+
+def guardar_fotos_reporte(archivos, id_reporte):
+    rutas = []
+    for i, archivo in enumerate(archivos, start=1):
+        imagen = archivo.copy() if isinstance(archivo, Image.Image) else Image.open(archivo)
+        imagen = ImageOps.exif_transpose(imagen).convert("RGB")
+        imagen.thumbnail((1600, 1600))
+        ruta = FOTOS_REPORTES_DIR / f"{id_reporte}_{i}.jpg"
+        imagen.save(ruta, format="JPEG", quality=80, optimize=True)
+        rutas.append(str(ruta))
+    return rutas
+
+
+def _fila_flujo(suc, dia, bruto=0.0, cobrados=0, costo=0.0, f_ini=0, f_fin=0, total=None, elaboro="", usuario="", rid=""):
+    return {
+        "ID": rid, "Fecha": dia.strftime("%d/%m/%Y"), "Sitio / Unidad": suc,
+        "Costo Boleto": float(costo), "Folio Inicial": int(f_ini), "Folio Final": int(f_fin),
+        "Total Boletos": int(cobrados if total is None else total), "Sin Cobro": 0, "Cancelados": 0, "Perdidos": 0,
+        "Boletos Cobrados": int(cobrados), "Ingreso Bruto": float(bruto),
+        "Gastos Especiales": 0.0, "Gastos Generales / Nómina": 0.0, "Total Gastos": 0.0, "Ingreso Neto": float(bruto),
+        "Elaboró": elaboro, "Usuario": usuario, "Nivel Auditoría": "Conforme", "Tipo": "Operación Regular",
+    }
+
+
+def registros_flujo_periodo(desde, hasta, sucursales):
+    """Une reportes físicos de ingresos, cobros digitales y gastos en el esquema del Excel oficial.
+    Si una sucursal/fecha tiene reporte físico de ingresos, ese manda; si no, se usan los cobros digitales."""
+    permitidas = set(sucursales)
+    filas = {}
+    for r in _leer_lista_json(FISICOS_FILE):
+        if r.get("tipo_reporte") != "ingresos":
+            continue
+        dia = fecha_flexible(r.get("Fecha"))
+        suc = r.get("Sitio / Unidad")
+        if dia and suc in permitidas and desde <= dia <= hasta:
+            fila = _fila_flujo(suc, dia, r.get("Ingreso Bruto", 0), r.get("Boletos Cobrados", 0), r.get("Costo Boleto", 0),
+                               r.get("Folio Inicial", 0), r.get("Folio Final", 0), r.get("Total Boletos"),
+                               r.get("Elaboró", ""), r.get("Usuario", ""), r.get("ID", ""))
+            for k in ("Sin Cobro", "Cancelados", "Perdidos"):
+                fila[k] = int(r.get(k, 0) or 0)
+            filas[(suc, dia)] = fila
+    digitales = {}
+    for reg in st.session_state.get("vehiculos", []):
+        for pago in reg.get("pagos", []) or []:
+            if pago.get("estado") != "Pagado":
+                continue
+            dia = fecha_flexible(pago.get("fecha_hora"))
+            suc = pago.get("sucursal") or reg.get("sucursal")
+            if dia and suc in permitidas and desde <= dia <= hasta:
+                acum = digitales.setdefault((suc, dia), [0.0, 0])
+                acum[0] += dinero(pago.get("importe"))
+                acum[1] += 1
+    for clave, (importe, n) in digitales.items():
+        if clave not in filas:
+            suc, dia = clave
+            filas[clave] = _fila_flujo(suc, dia, importe, n, (importe / n) if n else 0, usuario="Cobro digital")
+    for g in _leer_lista_json(GASTOS_FILE_RF):
+        dia = fecha_flexible(g.get("fecha"))
+        suc = g.get("sucursal")
+        if not (dia and suc in permitidas and desde <= dia <= hasta):
+            continue
+        fila = filas.setdefault((suc, dia), _fila_flujo(suc, dia, usuario="Gastos"))
+        monto = dinero(g.get("importe"))
+        if g.get("categoria") == "Nómina":
+            fila["Gastos Generales / Nómina"] += monto
+        else:
+            fila["Gastos Especiales"] += monto
+    resultado = []
+    for fila in filas.values():
+        fila["Total Gastos"] = fila["Gastos Generales / Nómina"] + fila["Gastos Especiales"]
+        fila["Ingreso Neto"] = fila["Ingreso Bruto"] - fila["Total Gastos"]
+        resultado.append(fila)
+    return sorted(resultado, key=lambda f: (fecha_flexible(f["Fecha"]), f["Sitio / Unidad"]))
+
+
+
+# ---------------------------------------------------------------------
+# REPORTES POR SERVICIO (SUCURSAL) Y GLOBAL: semana / quincena / mes
+# ---------------------------------------------------------------------
+NOMBRES_DIA = ["LUNES", "MARTES", "MIÉRCOLES", "JUEVES", "VIERNES", "SÁBADO", "DOMINGO"]
+COLUMNAS_NO_MONEDA = {"Fecha", "Día", "Sucursal", "Categoría", "Días con venta", "Días del periodo", "Margen %", "Sin información",
+                      "N° de día", "Día actual", "Día anterior", "Fecha actual", "Fecha anterior"}
+
+
+def rango_periodo(tipo, referencia, desde_pers=None, hasta_pers=None):
+    """Devuelve (desde, hasta) para Semana (lun-dom), Quincena (1-15 / 16-fin), Mes o Personalizado."""
+    if tipo == "Semana":
+        lunes = referencia - timedelta(days=referencia.weekday())
+        return lunes, lunes + timedelta(days=6)
+    primer_dia_mes = referencia.replace(day=1)
+    primer_dia_sig = (primer_dia_mes + timedelta(days=32)).replace(day=1)
+    ultimo_dia_mes = primer_dia_sig - timedelta(days=1)
+    if tipo == "Quincena":
+        if referencia.day <= 15:
+            return primer_dia_mes, referencia.replace(day=15)
+        return referencia.replace(day=16), ultimo_dia_mes
+    if tipo == "Mes":
+        return primer_dia_mes, ultimo_dia_mes
+    return desde_pers, hasta_pers
+
+
+def construir_reporte(desde, hasta, sucursales):
+    """Estado de resultados por sucursal: vendió, gastos, utilidad; venta diaria; promedio por día de la semana."""
+    sucursales = list(sucursales)
+    registros = registros_flujo_periodo(desde, hasta, sucursales)
+    dias = [desde + timedelta(days=i) for i in range((hasta - desde).days + 1)]
+    ventas, gastos = {}, {}
+    for r in registros:
+        clave = (r["Sitio / Unidad"], fecha_flexible(r["Fecha"]))
+        ventas[clave] = ventas.get(clave, 0.0) + float(r["Ingreso Bruto"])
+        gastos[clave] = gastos.get(clave, 0.0) + float(r["Total Gastos"])
+
+    filas = []
+    for suc in sucursales:
+        v = sum(ventas.get((suc, d), 0.0) for d in dias)
+        g = sum(gastos.get((suc, d), 0.0) for d in dias)
+        dias_venta = sum(1 for d in dias if ventas.get((suc, d), 0.0) > 0)
+        filas.append({
+            "Sucursal": suc, "Ventas": v, "Gastos": g, "Utilidad": v - g,
+            "Margen %": round((v - g) / v * 100, 1) if v else 0.0,
+            "Días con venta": dias_venta,
+            "Promedio por día": (v / dias_venta) if dias_venta else 0.0,
+        })
+    resumen = pd.DataFrame(filas, columns=["Sucursal", "Ventas", "Gastos", "Utilidad", "Margen %", "Días con venta", "Promedio por día"])
+    v_tot, g_tot = float(resumen["Ventas"].sum()), float(resumen["Gastos"].sum())
+    dias_con_venta_global = sum(1 for d in dias if any(ventas.get((suc, d), 0.0) > 0 for suc in sucursales))
+    fila_total = {
+        "Sucursal": "TOTAL", "Ventas": v_tot, "Gastos": g_tot, "Utilidad": v_tot - g_tot,
+        "Margen %": round((v_tot - g_tot) / v_tot * 100, 1) if v_tot else 0.0,
+        "Días con venta": dias_con_venta_global,
+        "Promedio por día": (v_tot / dias_con_venta_global) if dias_con_venta_global else 0.0,
+    }
+    resumen_total = pd.concat([resumen, pd.DataFrame([fila_total])], ignore_index=True)
+
+    sucursales_con_venta = [suc for suc in sucursales if any(ventas.get((suc, d), 0.0) > 0 for d in dias)] or sucursales
+    filas_dia, filas_util = [], []
+    acumulado = 0.0
+    for d in dias:
+        fila = {"Fecha": d.strftime("%d/%m/%Y"), "Día": NOMBRES_DIA[d.weekday()]}
+        for suc in sucursales_con_venta:
+            fila[suc] = ventas.get((suc, d), 0.0)
+        v_dia = sum(ventas.get((suc, d), 0.0) for suc in sucursales)
+        g_dia = sum(gastos.get((suc, d), 0.0) for suc in sucursales)
+        fila["TOTAL"] = v_dia
+        filas_dia.append(fila)
+        acumulado += v_dia - g_dia
+        filas_util.append({"Fecha": d.strftime("%d/%m/%Y"), "Día": NOMBRES_DIA[d.weekday()], "Ventas": v_dia,
+                           "Gastos": g_dia, "Utilidad": v_dia - g_dia, "Utilidad acumulada": acumulado})
+    diario_sucursal = pd.DataFrame(filas_dia)
+    utilidad_diaria = pd.DataFrame(filas_util)
+
+    filas_sem = []
+    for idx, nombre in enumerate(NOMBRES_DIA):
+        fechas_idx = [d for d in dias if d.weekday() == idx]
+        total_dia = sum(fila["Ventas"] for fila, d in zip(filas_util, dias) if d.weekday() == idx)
+        filas_sem.append({"Día": nombre, "Días del periodo": len(fechas_idx), "Ventas": total_dia,
+                          "Promedio por día": (total_dia / len(fechas_idx)) if fechas_idx else 0.0})
+    por_dia_semana = pd.DataFrame(filas_sem)
+
+    acum_cat = {}
+    for g in _leer_lista_json(GASTOS_FILE_RF):
+        dia = fecha_flexible(g.get("fecha"))
+        if dia and desde <= dia <= hasta and g.get("sucursal") in sucursales:
+            clave = (g.get("sucursal"), g.get("categoria") or "Otros")
+            acum_cat[clave] = acum_cat.get(clave, 0.0) + dinero(g.get("importe"))
+    gastos_categoria = pd.DataFrame(
+        [{"Sucursal": k[0], "Categoría": k[1], "Importe": v} for k, v in sorted(acum_cat.items())],
+        columns=["Sucursal", "Categoría", "Importe"],
+    )
+    return {"resumen": resumen, "resumen_total": resumen_total, "diario_sucursal": diario_sucursal,
+            "utilidad_diaria": utilidad_diaria, "por_dia_semana": por_dia_semana, "gastos_categoria": gastos_categoria,
+            "ventas_total": v_tot, "gastos_total": g_tot, "sucursales_con_venta": sucursales_con_venta}
+
+
+def rango_anterior(tipo, desde, hasta):
+    """Periodo inmediato anterior: semana-7 días, quincena anterior, mes anterior o igual duración."""
+    if tipo == "Semana":
+        return desde - timedelta(days=7), hasta - timedelta(days=7)
+    if tipo == "Quincena":
+        if desde.day == 1:
+            fin_prev = desde - timedelta(days=1)
+            return fin_prev.replace(day=16), fin_prev
+        return desde.replace(day=1), desde.replace(day=15)
+    if tipo == "Mes":
+        fin_prev = desde - timedelta(days=1)
+        return fin_prev.replace(day=1), fin_prev
+    dias = (hasta - desde).days + 1
+    fin_prev = desde - timedelta(days=1)
+    return fin_prev - timedelta(days=dias - 1), fin_prev
+
+
+def _variacion_pct(actual, anterior):
+    return round((actual - anterior) / anterior * 100, 1) if anterior else None
+
+
+def construir_comparativo(rep_act, rep_ant):
+    """Compara dos reportes (actual vs anterior): por sucursal y día a día."""
+    a = rep_act["resumen_total"].set_index("Sucursal")
+    b = rep_ant["resumen_total"].set_index("Sucursal")
+    filas = []
+    for suc in a.index:
+        va, ga, ua = float(a.loc[suc, "Ventas"]), float(a.loc[suc, "Gastos"]), float(a.loc[suc, "Utilidad"])
+        vb = float(b.loc[suc, "Ventas"]) if suc in b.index else 0.0
+        gb = float(b.loc[suc, "Gastos"]) if suc in b.index else 0.0
+        ub = float(b.loc[suc, "Utilidad"]) if suc in b.index else 0.0
+        filas.append({
+            "Sucursal": suc, "Ventas actual": va, "Ventas anterior": vb, "Var. ventas $": va - vb,
+            "Var. ventas %": _variacion_pct(va, vb), "Gastos actual": ga, "Gastos anterior": gb,
+            "Utilidad actual": ua, "Utilidad anterior": ub, "Var. utilidad $": ua - ub,
+            "Var. utilidad %": _variacion_pct(ua, ub),
+        })
+    resumen = pd.DataFrame(filas)
+    da, db = rep_act["utilidad_diaria"], rep_ant["utilidad_diaria"]
+    filas_d = []
+    for i in range(max(len(da), len(db))):
+        fa = da.iloc[i] if i < len(da) else None
+        fb = db.iloc[i] if i < len(db) else None
+        va = float(fa["Ventas"]) if fa is not None else 0.0
+        vb = float(fb["Ventas"]) if fb is not None else 0.0
+        filas_d.append({
+            "N° de día": i + 1,
+            "Día actual": fa["Día"] if fa is not None else "", "Fecha actual": fa["Fecha"] if fa is not None else "",
+            "Ventas actual": va,
+            "Día anterior": fb["Día"] if fb is not None else "", "Fecha anterior": fb["Fecha"] if fb is not None else "",
+            "Ventas anterior": vb, "Variación $": va - vb,
+        })
+    return {"resumen": resumen, "diario": pd.DataFrame(filas_d)}
+
+
+def generar_excel_reporte(rep, titulo, periodo_txt, comparativo=None):
+    """Excel con Resumen, Venta diaria, Utilidad diaria, Por día de la semana y Gastos por categoría."""
+    hojas = [("Resumen", rep["resumen_total"])]
+    if len(rep["sucursales_con_venta"]) > 1:
+        hojas.append(("Venta diaria por sucursal", rep["diario_sucursal"]))
+    hojas += [("Utilidad diaria", rep["utilidad_diaria"]), ("Por día de la semana", rep["por_dia_semana"]),
+              ("Gastos por categoría", rep["gastos_categoria"])]
+    if comparativo:
+        hojas += [("Comparativo", comparativo["resumen"]), ("Comparativo diario", comparativo["diario"])]
+    salida = io.BytesIO()
+    verde = PatternFill(start_color="0B3B24", end_color="0B3B24", fill_type="solid")
+    with pd.ExcelWriter(salida, engine="openpyxl") as writer:
+        for nombre, df in hojas:
+            if df.empty:
+                df = pd.DataFrame({"Sin información": ["No hay datos en el periodo"]})
+            df.to_excel(writer, sheet_name=nombre, index=False, startrow=3)
+            ws = writer.sheets[nombre]
+            ws["A1"] = titulo
+            ws["A1"].font = Font(size=14, bold=True, color="0B3B24")
+            ws["A2"] = periodo_txt
+            ws["A2"].font = Font(size=10, italic=True)
+            for celda in ws[4]:
+                celda.fill = verde
+                celda.font = Font(bold=True, color="FFFFFF")
+                celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for i, col in enumerate(df.columns, start=1):
+                letra = get_column_letter(i)
+                ancho = max([len(str(col))] + [len(str(v)) for v in df[col].head(300)]) + 3
+                ws.column_dimensions[letra].width = min(max(ancho, 12), 40)
+                for celda in list(ws[letra])[4:]:
+                    if isinstance(celda.value, (int, float)) and str(col).endswith("%"):
+                        celda.number_format = '0.0"%"'
+                    elif isinstance(celda.value, (int, float)) and col not in COLUMNAS_NO_MONEDA:
+                        celda.number_format = '"$"#,##0.00'
+            for fila in ws.iter_rows(min_row=5):
+                if str(fila[0].value) == "TOTAL":
+                    for celda in fila:
+                        celda.font = Font(bold=True)
+            ws.freeze_panes = "A5"
+    return salida.getvalue()
+
+
+def formato_columnas_df(df):
+    config = {}
+    for col in df.columns:
+        if str(col).endswith("%"):
+            config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+        elif col not in COLUMNAS_NO_MONEDA:
+            config[col] = st.column_config.NumberColumn(col, format="$%.2f")
+    return config
+
+
+tab_ing, tab_list, tab_salida, tab_balance, tab_imp, tab_rep, tab_corte, tab_cierre_diario, tab_aud, tab_qrs, tab_pruebas, tab_intel, tab_reportes, tab_tarifas = st.tabs([
     "📥 Ingreso y Fotografías",
     "📋 Vehículos Registrados",
     "🚘 Salida y Cobro",
@@ -1915,6 +2860,8 @@ tab_ing, tab_list, tab_salida, tab_balance, tab_imp, tab_rep, tab_corte, tab_cie
     "🏷️ Credenciales QR Institucionales",
     "🧪 Pruebas Operativas",
     "🧠 Inteligencia Operativa",
+    "📄 Reportes físicos y Excel",
+    "💲 Tarifas",
 ])
 
 
@@ -1925,7 +2872,7 @@ with tab_ing:
     encabezado_institucional("REGISTRO DE INGRESO DE VEHÍCULO", "OPERACIÓN 1 · RECEPCIÓN", "Protocolo institucional de recepción con evidencia fotográfica obligatoria")
     c1, c2 = st.columns(2)
     with c1:
-        if es_global:
+                if es_global:
             sucursal = st.selectbox("Sucursal operativa", ["-- Selecciona la Sucursal --"] + SUCURSALES)
         else:
             sucursal = st.session_state.sucursal_asignada
@@ -1934,9 +2881,21 @@ with tab_ing:
         color = st.text_input("Color", key="ing_color")
     with c2:
         placas = st.text_input("Placas / folio de placa", key="ing_placas").strip().upper()
-        tarifa_default = float(PRECIOS_SUCURSALES.get(sucursal, 50))
-        tarifa = tarifa_default
-        st.metric("Tarifa fija de la sucursal", f"${tarifa:,.2f} MXN")
+        cfg_tarifa = tarifa_de(sucursal)
+        mods_ingreso = modalidades_disponibles(cfg_tarifa)
+        modalidad_tarifa = mods_ingreso[0]
+        if len(mods_ingreso) > 1:
+            modalidad_tarifa = st.radio(
+                "Tarifa a aplicar", mods_ingreso,
+                format_func=lambda m: etiqueta_modalidad(cfg_tarifa, m),
+                key=f"ing_modalidad_{sucursal}",
+            )
+        tarifa = precio_inicial(cfg_tarifa, modalidad_tarifa)
+        if modalidad_tarifa == "fija":
+            st.metric("Tarifa fija de la sucursal", f"${tarifa:,.2f} MXN")
+        else:
+            st.metric(ETIQUETAS_MODALIDAD[modalidad_tarifa], f"${tarifa:,.2f} MXN")
+            st.caption(etiqueta_modalidad(cfg_tarifa, modalidad_tarifa) + ". El total se calcula al dar salida.")
         operador = st.text_input("Valet / operador", value=st.session_state.usuario_autenticado)
     st.subheader("Observaciones y custodia")
     sin_valores = st.checkbox("⚡ Sin objetos de valor declarados", key="ing_sin_valores")
@@ -2075,6 +3034,7 @@ with tab_ing:
                     "color": color.strip(),
                     "placas": placas,
                     "tarifa": float(tarifa),
+                    "modalidad_tarifa": modalidad_tarifa,
                     "operador": operador.strip(),
                     "custodia": custodia.strip() or "Sin objetos declarados",
                     "fotos": rutas,
@@ -2223,7 +3183,7 @@ with tab_salida:
                 st.session_state.qr_scan_nonce_salida = int(st.session_state.get("qr_scan_nonce_salida", 0)) + 1
                 st.query_params.clear()
                 st.rerun()
-    else:
+        else:
         archivo_qr_salida = st.file_uploader("Sube la imagen QR del ticket", type=["png", "jpg", "jpeg"], key="archivo_qr_salida")
         if archivo_qr_salida:
             valor_busqueda = leer_codigo_qr(Image.open(archivo_qr_salida)) or ""
@@ -2260,9 +3220,35 @@ with tab_salida:
         elif registro_salida.get("estado") != "En Resguardo":
             st.warning("El vehículo no está en estado 'En Resguardo'. Revisa el registro antes de continuar.")
         else:
-            tarifa_salida = dinero(registro_salida.get("tarifa", PRECIOS_SUCURSALES.get(registro_salida.get("sucursal"), 0)))
-            st.metric("Tarifa fija a cobrar", f"${tarifa_salida:,.2f} MXN")
-            st.caption("La tarifa se toma del registro de ingreso. Verifica cualquier cambio autorizado antes de cobrar.")
+            cfg_sal = tarifa_de(registro_salida.get("sucursal"))
+            modalidad_reg = registro_salida.get("modalidad_tarifa") or ("fija" if cfg_sal["tipo"] == "fija" else "tiempo")
+            modalidad_sal = modalidad_reg
+            if es_contador:
+                opciones_mod = list(dict.fromkeys([modalidad_reg] + modalidades_disponibles(cfg_sal)))
+                modalidad_sal = st.selectbox(
+                    "Modalidad de cobro (solo Contador puede cambiarla)", opciones_mod,
+                    format_func=lambda m: etiqueta_modalidad(cfg_sal, m),
+                    key=f"modalidad_sal_{registro_salida['id']}",
+                )
+            minutos_est = minutos_estancia(registro_salida)
+            precio_reg = dinero(registro_salida.get("tarifa", cfg_sal["precio_fijo"])) if modalidad_sal == "fija" and modalidad_reg == "fija" else None
+            tarifa_calc = calcular_cobro(cfg_sal, modalidad_sal, minutos_est, precio_reg)
+            tarifa_salida = tarifa_calc
+            ajuste_manual = False
+            motivo_ajuste = ""
+            if es_contador:
+                ajuste_manual = st.checkbox("Cambiar el importe manualmente", key=f"ajuste_manual_{registro_salida['id']}")
+                if ajuste_manual:
+                    tarifa_salida = st.number_input(
+                        "Importe a cobrar ($)", min_value=0.0, value=float(tarifa_calc), step=5.0,
+                        key=f"ajuste_importe_{registro_salida['id']}",
+                    )
+                    motivo_ajuste = st.text_input("Motivo del cambio (obligatorio)", key=f"ajuste_motivo_{registro_salida['id']}")
+            st.metric(ETIQUETAS_MODALIDAD.get(modalidad_sal, "Tarifa") + " · a cobrar", f"${tarifa_salida:,.2f} MXN")
+            if modalidad_sal != "fija":
+                st.caption(f"Tiempo en sitio: {texto_duracion(minutos_est)} · {etiqueta_modalidad(cfg_sal, modalidad_sal)}. El importe final se recalcula al confirmar.")
+            else:
+                st.caption("La tarifa se toma del registro de ingreso. Verifica cualquier cambio autorizado antes de cobrar.")
             forma_pago = st.radio("Método de pago", ["Efectivo", "Tarjeta", "QR"], horizontal=True, key=f"pago_metodo_{registro_salida['id']}")
             referencia_pago = st.text_input("Referencia / autorización (si aplica)", key=f"pago_ref_{registro_salida['id']}")
             nota_pago = st.text_input("Observaciones del cobro", key=f"pago_nota_{registro_salida['id']}")
@@ -2284,13 +3270,18 @@ with tab_salida:
                 key=f"confirmar_salida_{registro_salida['id']}",
             )
             if st.button("💳 Registrar cobro y salida", type="primary", use_container_width=True, disabled=not confirmar_pago, key=f"btn_salida_{registro_salida['id']}"):
-                if referencia_obligatoria and not referencia_pago.strip():
+                if ajuste_manual and not motivo_ajuste.strip():
+                    st.error("Captura el motivo del cambio de importe.")
+                elif referencia_obligatoria and not referencia_pago.strip():
                     st.error("Captura la referencia de autorización del proveedor.")
                 elif referencia_obligatoria and not pago_aprobado_externamente:
                     st.error("No se registró la salida: confirma primero que el proveedor aprobó el pago.")
                 else:
                     momento_operacion = datetime.now()
                     ahora = momento_operacion.strftime("%Y-%m-%d %H:%M:%S")
+                    minutos_final = minutos_estancia(registro_salida, momento_operacion)
+                    if not ajuste_manual:
+                        tarifa_salida = calcular_cobro(cfg_sal, modalidad_sal, minutos_final, precio_reg)
                     pago = {
                         "id_pago": str(uuid.uuid4()),
                         "fecha_hora": ahora,
@@ -2304,8 +3295,14 @@ with tab_salida:
                         "observaciones": nota_pago.strip(),
                         "usuario": st.session_state.usuario_autenticado,
                         "confirmacion_manual": forma_pago != "Efectivo",
+                        "modalidad_tarifa": modalidad_sal,
+                        "minutos_estancia": minutos_final,
+                        "importe_calculado": tarifa_calc if ajuste_manual else tarifa_salida,
+                        "ajuste_manual": bool(ajuste_manual),
+                        "motivo_ajuste": motivo_ajuste.strip(),
                     }
                     registro_salida.setdefault("pagos", []).append(pago)
+                    registro_salida["modalidad_tarifa"] = modalidad_sal
                     registro_salida["pago_estado"] = "Pagado"
                     registro_salida["metodo_pago"] = forma_pago
                     registro_salida["importe_cobrado"] = tarifa_salida
@@ -2328,7 +3325,7 @@ with tab_salida:
                                 "placas": registro_salida.get("placas", ""),
                             },
                         }
-                        guardar_evento_auditoria("SALIDA Y COBRO", f"Folio {registro_salida.get('id')} · ${tarifa_salida:.2f} · {forma_pago} · {registro_salida.get('sucursal')}")
+                        guardar_evento_auditoria("SALIDA Y COBRO", f"Folio {registro_salida.get('id')} · ${tarifa_salida:.2f} · {forma_pago} · {registro_salida.get('sucursal')} · {modalidad_sal}" + (f" · AJUSTE MANUAL (calculado ${tarifa_calc:.2f}): {motivo_ajuste.strip()}" if ajuste_manual else ""))
                         st.success(f"Salida registrada. Folio {registro_salida.get('id')}; cobro de ${tarifa_salida:,.2f} MXN por {forma_pago}.")
                         st.rerun()
 
@@ -2374,10 +3371,7 @@ with tab_salida:
             f"Referencia: {pago_reciente.get('referencia', '') or 'No aplica'}",
             f"Atendio: {pago_reciente.get('usuario', '')}",
             "--------------------------------",
-            "BIENVENIDO. Primera hora $25.00.",
-            "A partir de la segunda hora, aplican",
-            "tarifas por fraccion: 15 min $10.00",
-            "los primeros 15, posteriores $5.00.",
+            *lineas_tarifa_ticket(registro_reciente.get('sucursal', ''), pago_reciente.get('modalidad_tarifa')),
             "Factura: facturacionclubpark@gmail.com",
             "Conserve este ticket.",
             "Gracias por su preferencia.",
@@ -2862,6 +3856,22 @@ with tab_cierre_diario:
     m4.metric("Balance del día", f"${balance_cierre:,.2f}")
     st.caption("El balance se calcula con cobros confirmados menos gastos registrados y gastos adicionales del cierre; los boletos cancelados/perdidos no se cuentan como cobros salvo que exista un pago confirmado.")
 
+    st.markdown("#### 📷 Evidencia fotográfica del cierre")
+    st.caption("Sube fotos de la hoja de cierre, boletos y efectivo. Quedan guardadas con este cierre y las puede consultar el Contador.")
+    fotos_cierre_archivos = st.file_uploader(
+        "Subir fotos desde la galería", type=["png", "jpg", "jpeg"], accept_multiple_files=True,
+        key=llave_unica(f"cierre_fotos_{clave_widget_cierre}"),
+    )
+    with st.expander("📸 Tomar foto con la cámara"):
+        foto_cierre_camara = st.camera_input("Cámara", key=llave_unica(f"cierre_camara_{clave_widget_cierre}"))
+    nuevas_fotos_cierre = list(fotos_cierre_archivos or []) + ([foto_cierre_camara] if foto_cierre_camara else [])
+    if nuevas_fotos_cierre:
+        cols_prev = st.columns(3)
+        for i_prev, f_prev in enumerate(nuevas_fotos_cierre):
+            cols_prev[i_prev % 3].image(f_prev, use_container_width=True)
+    else:
+        st.warning("Aún no has adjuntado evidencia fotográfica de este cierre.")
+
     cierres_guardados = cargar_cierres_diarios()
     cierre_existente = next((c for c in cierres_guardados if c.get("fecha") == str(fecha_cierre) and c.get("sucursal") == sucursal_cierre), None)
     if cierre_existente:
@@ -2904,11 +3914,18 @@ with tab_cierre_diario:
             else:
                 cierres_guardados.insert(0, cierre)
             try:
+                rutas_evidencia = list((cierre_existente or {}).get("fotos_evidencia", []))
+                if nuevas_fotos_cierre:
+                    rutas_evidencia = []
+                    base_foto = re.sub(r"[^A-Za-z0-9_-]+", "_", f"CIERRE_{sucursal_cierre}_{fecha_cierre:%Y%m%d}")
+                    for i_ev, f_ev in enumerate(nuevas_fotos_cierre, start=1):
+                        rutas_evidencia.append(guardar_foto(f_ev, base_foto, f"evidencia_{i_ev}"))
+                cierre["fotos_evidencia"] = rutas_evidencia
                 guardar_cierres_diarios(cierres_guardados)
                 guardar_evento_auditoria("CIERRE DIARIO POR SUCURSAL", f"{sucursal_cierre} · {fecha_cierre} · ingresos ${ingresos_confirmados_cierre:.2f} · gastos ${total_gastos_cierre:.2f} · balance ${balance_cierre:.2f}")
                 st.success("Cierre diario guardado. Ya puedes descargar la hoja de cálculo para entregar el balance.")
                 st.rerun()
-            except OSError as exc:
+            except Exception as exc:
                 st.error(f"No se pudo guardar el cierre diario: {exc}")
 
     st.divider()
@@ -2929,6 +3946,18 @@ with tab_cierre_diario:
         }
         etiqueta_cierre = st.selectbox("Selecciona el cierre que vas a entregar", list(opciones_cierre.keys()), key="seleccionar_cierre_descarga")
         cierre_descarga = opciones_cierre[etiqueta_cierre]
+        fotos_ev = cierre_descarga.get("fotos_evidencia") or []
+        if fotos_ev:
+            st.markdown("**📷 Evidencia fotográfica del cierre**")
+            cols_ev = st.columns(3)
+            for i_ev, ruta_ev in enumerate(fotos_ev):
+                p_ev = Path(ruta_ev)
+                if not p_ev.is_absolute():
+                    p_ev = DATA_DIR / p_ev
+                if p_ev.exists():
+                    cols_ev[i_ev % 3].image(str(p_ev), use_container_width=True)
+        else:
+            st.caption("Este cierre no tiene evidencia fotográfica.")
         fecha_exportacion = fecha_a_date(cierre_descarga.get("fecha"))
         registros_excel_cierre = [
             r for r in st.session_state.vehiculos
@@ -3011,7 +4040,7 @@ with tab_cierre_diario:
                 data=df_resumen_cierre.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"ClubPark_Cierre_{cierre_descarga.get('fecha','')}.csv",
                 mime="text/csv",
-                key="descargar_csv_cierre_diario",
+                                key="descargar_csv_cierre_diario",
             )
         except Exception as exc:
             st.error(f"No se pudo preparar el Excel del cierre diario: {exc}")
@@ -3332,7 +4361,7 @@ with tab_aud:
             st.info(f"💡 Escribe exactamente `{texto_confirmacion}` o marca la casilla 'Autorizar reinicio' para activar el botón.")
 
         if st.button(
-            "🧹 Reiniciar datos operativos seleccionados",
+                        "🧹 Reiniciar datos operativos seleccionados",
             type="primary" if puede_reiniciar else "secondary",
             disabled=not puede_reiniciar,
             key="ejecutar_reinicio_admin",
@@ -3643,7 +4672,7 @@ with tab_intel:
                     guardar_evento_auditoria("Inteligencia Operativa", f"{alerta['tipo']}: {alerta['detalle']}")
                 st.success("Alertas registradas en la bitácora de auditoría.")
         else:
-            st.success("Sin alertas: no hay estancias críticas, placas duplicadas ni cobros pendientes detectados.")
+                        st.success("Sin alertas: no hay estancias críticas, placas duplicadas ni cobros pendientes detectados.")
         st.markdown("**Recomendaciones automáticas**")
         for recomendacion in recomendaciones:
             st.markdown(f"- {recomendacion}")
@@ -3677,3 +4706,262 @@ with tab_intel:
         st.success("La impresión térmica opera sin fallos registrados.")
     else:
         st.caption("Aún no hay eventos de impresión: ejecuta la prueba de impresión en 🧪 Pruebas Operativas o en 🖨️ Re-Impresión Térmica.")
+
+
+# ---------------------------------------------------------------------
+# TAB: REPORTES FÍSICOS Y EXCEL OFICIAL
+# ---------------------------------------------------------------------
+with tab_reportes:
+    encabezado_institucional("REPORTES FÍSICOS Y ENTREGA", "INGRESOS · GASTOS · EXCEL", "Sube la hoja física de ingresos o de gastos y entrega el Excel oficial")
+    if "rf_nonce" not in st.session_state:
+        st.session_state.rf_nonce = 0
+    nonce = st.session_state.rf_nonce
+    sucursales_rf = SUCURSALES if es_global else [st.session_state.sucursal_asignada]
+    sub_subir, sub_lista, sub_reporte, sub_excel = st.tabs(["📤 Subir reporte", "🗂️ Reportes subidos", "📈 Reporte por sucursal / global", "📊 Excel oficial"])
+
+    # ---------------- SUBIR ----------------
+    with sub_subir:
+        tipo_rf = st.radio("¿Qué reporte vas a subir?", ["📥 Reporte de ingresos", "💸 Reporte de gastos"], horizontal=True, key=f"rf_tipo_{nonce}")
+        es_ingresos = tipo_rf.startswith("📥")
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            suc_rf = st.selectbox("Sucursal", sucursales_rf, key=f"rf_suc_{nonce}")
+        with rc2:
+            fecha_rf = st.date_input("Fecha de operación", value=datetime.now().date(), key=f"rf_fecha_{nonce}")
+        fecha_rf_str = fecha_rf.strftime("%d/%m/%Y")
+
+        modo_rf = st.radio("Captura de la hoja física", ["📸 Cámara", "📁 Galería"], horizontal=True, key=f"rf_modo_{nonce}")
+        fotos_rf = []
+        if modo_rf.startswith("📸"):
+            foto_rf = st.camera_input("Foto de la hoja física", key=f"rf_cam_{nonce}")
+            if foto_rf:
+                fotos_rf = [foto_rf]
+        else:
+            fotos_rf = list(st.file_uploader("Fotos de la hoja (puedes subir varias)", type=["png", "jpg", "jpeg", "webp"],
+                                             accept_multiple_files=True, key=f"rf_gal_{nonce}") or [])
+        if fotos_rf:
+            cols_rf = st.columns(3)
+            for i_rf, f_rf in enumerate(fotos_rf):
+                cols_rf[i_rf % 3].image(f_rf, use_container_width=True)
+
+        reportes_actuales = _leer_lista_json(FISICOS_FILE)
+
+        if es_ingresos:
+            directo = es_sucursal_directa(suc_rf)
+            cfg_rf = tarifa_de(suc_rf)
+            existente_rf = next((r for r in reportes_actuales if r.get("tipo_reporte") == "ingresos"
+                                 and r.get("Sitio / Unidad") == suc_rf and r.get("Fecha") == fecha_rf_str), None)
+            if existente_rf:
+                if es_contador:
+                    st.warning("Ya existe un reporte de ingresos de esta sucursal y fecha. Al guardar, se reemplazará.")
+                else:
+                    st.error(f"Ya existe un reporte de ingresos de {suc_rf} para {fecha_rf_str}. Solo el Contador puede reemplazarlo.")
+            if directo:
+                st.info("📌 Esta sucursal reporta ingreso bruto directo (sin control por folio).")
+                ingreso_directo = st.number_input("Ingreso bruto del día ($)", min_value=0.0, step=50.0, key=f"rf_directo_{nonce}")
+                costo_rf, f_ini_rf, f_fin_rf, sin_rf, canc_rf, perd_rf = 0.0, 0, 0, 0, 0, 0
+                total_bol_rf, cobrados_rf, bruto_rf = 0, 0, float(ingreso_directo)
+            else:
+                costo_rf = st.number_input("Tarifa por boleto ($)", min_value=0.0, value=float(cfg_rf["precio_fijo"]), step=5.0, key=f"rf_costo_{nonce}_{suc_rf}")
+                n1, n2, n3 = st.columns(3)
+                f_ini_rf = n1.number_input("Folio inicial", min_value=0, step=1, key=f"rf_fini_{nonce}")
+                f_fin_rf = n1.number_input("Folio final", min_value=0, step=1, key=f"rf_ffin_{nonce}")
+                sin_rf = n2.number_input("Boletos sin cobro (cortesía)", min_value=0, step=1, key=f"rf_sin_{nonce}")
+                canc_rf = n2.number_input("Boletos cancelados", min_value=0, step=1, key=f"rf_canc_{nonce}")
+                perd_rf = n3.number_input("Boletos perdidos", min_value=0, step=1, key=f"rf_perd_{nonce}")
+                total_bol_rf = calcular_boletos_block100(int(f_ini_rf), int(f_fin_rf))
+                cobrados_rf = max(0, total_bol_rf - int(sin_rf) - int(canc_rf))
+                bruto_rf = cobrados_rf * float(costo_rf)
+                if int(f_ini_rf) > 0 or int(f_fin_rf) > 0:
+                    st.info(f"Folio {int(f_ini_rf)} → {int(f_fin_rf)}: {total_bol_rf} boletos (ciclo de 100); menos cortesías y cancelados = {cobrados_rf} cobrados.")
+            exceso_rf = (not directo) and (int(sin_rf) + int(canc_rf) + int(perd_rf) > total_bol_rf)
+            if exceso_rf:
+                st.error("Cortesías, cancelados y perdidos superan el total de boletos. Corrige antes de guardar.")
+            st.metric("Ingreso bruto del reporte", f"${bruto_rf:,.2f} MXN")
+            e1, e2 = st.columns(2)
+            elaboro_rf = e1.text_input("Elaboró", value=st.session_state.usuario_autenticado, key=f"rf_elab_{nonce}")
+            recibe_rf = e2.text_input("Recibe (auditor / encargado)", key=f"rf_recibe_{nonce}")
+            cero_ok = True
+            if bruto_rf <= 0:
+                cero_ok = st.checkbox("Confirmo que el ingreso del día fue $0", key=f"rf_cero_{nonce}")
+            bloquear_rf = bool(existente_rf and not es_contador) or exceso_rf or not cero_ok
+            if st.button("💾 Guardar reporte de ingresos", type="primary", use_container_width=True, disabled=bloquear_rf, key=f"rf_btn_ing_{nonce}"):
+                if not fotos_rf and not es_contador:
+                    st.error("Adjunta la foto de la hoja física para guardar el reporte.")
+                else:
+                    rid = f"REP_{uuid.uuid4().hex[:8]}"
+                    try:
+                        rutas_rf = guardar_fotos_reporte(fotos_rf, rid)
+                        registro_rf = _fila_flujo(suc_rf, fecha_rf, bruto_rf, cobrados_rf, costo_rf, f_ini_rf, f_fin_rf, total_bol_rf,
+                                                  elaboro_rf or st.session_state.usuario_autenticado, st.session_state.usuario_autenticado, rid)
+                        registro_rf.update({"Sin Cobro": int(sin_rf), "Cancelados": int(canc_rf), "Perdidos": int(perd_rf),
+                                            "Recibe": recibe_rf, "tipo_reporte": "ingresos", "fotos": rutas_rf,
+                                            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                        reportes_actuales = [r for r in reportes_actuales if not (existente_rf and r.get("ID") == existente_rf.get("ID"))]
+                        reportes_actuales.insert(0, registro_rf)
+                        _guardar_lista_json(FISICOS_FILE, reportes_actuales)
+                        guardar_evento_auditoria("REPORTE FISICO DE INGRESOS", f"{suc_rf} · {fecha_rf_str} · ${bruto_rf:,.2f} · {rid}" + (" · REEMPLAZO" if existente_rf else ""))
+                        st.session_state.rf_nonce += 1
+                        st.success(f"Reporte de ingresos guardado ({rid}).")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo guardar el reporte: {exc}")
+        else:
+            st.markdown("**Captura los gastos de la hoja** (agrega una fila por gasto):")
+            tabla_gastos = st.data_editor(
+                pd.DataFrame([{"Categoría": "Nómina", "Concepto": "", "Importe": 0.0}]),
+                num_rows="dynamic", use_container_width=True, hide_index=True, key=f"rf_gastos_{nonce}",
+                column_config={
+                    "Categoría": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS_GASTO_RF, required=True),
+                    "Concepto": st.column_config.TextColumn("Concepto"),
+                    "Importe": st.column_config.NumberColumn("Importe ($)", min_value=0.0, step=10.0, format="$%.2f"),
+                },
+            )
+            filas_gasto = []
+            for fila in tabla_gastos.to_dict("records"):
+                concepto_g = str(fila.get("Concepto") or "").strip()
+                try:
+                    importe_g = float(fila.get("Importe") or 0)
+                except (TypeError, ValueError):
+                    importe_g = 0.0
+                if concepto_g and importe_g > 0:
+                    filas_gasto.append({"categoria": fila.get("Categoría") or "Otros", "concepto": concepto_g, "importe": importe_g})
+            total_gastos_rf = sum(f["importe"] for f in filas_gasto)
+            st.metric("Total de gastos del reporte", f"${total_gastos_rf:,.2f} MXN")
+            if st.button("💾 Guardar reporte de gastos", type="primary", use_container_width=True, key=f"rf_btn_gas_{nonce}"):
+                if not filas_gasto:
+                    st.error("Captura al menos un gasto con concepto e importe mayor a cero.")
+                elif not fotos_rf and not es_contador:
+                    st.error("Adjunta la foto de la hoja o comprobante para guardar el reporte.")
+                else:
+                    rid = f"GAS_{uuid.uuid4().hex[:8]}"
+                    try:
+                        rutas_rf = guardar_fotos_reporte(fotos_rf, rid)
+                        gastos_archivo = _leer_lista_json(GASTOS_FILE_RF)
+                        for fila in filas_gasto:
+                            gastos_archivo.insert(0, {
+                                "id": uuid.uuid4().hex[:12].upper(), "fecha": str(fecha_rf), "sucursal": suc_rf,
+                                "categoria": fila["categoria"], "concepto": fila["concepto"], "importe": fila["importe"],
+                                "registrado_por": st.session_state.usuario_autenticado,
+                                "registrado_en": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "origen": "Reporte físico", "reporte_fisico_id": rid, "fotos": rutas_rf,
+                            })
+                        _guardar_lista_json(GASTOS_FILE_RF, gastos_archivo)
+                        reportes_actuales.insert(0, {
+                            "ID": rid, "tipo_reporte": "gastos", "Fecha": fecha_rf_str, "Sitio / Unidad": suc_rf,
+                            "Total Gastos": total_gastos_rf, "detalle_gastos": filas_gasto, "fotos": rutas_rf,
+                            "Usuario": st.session_state.usuario_autenticado,
+                            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                        _guardar_lista_json(FISICOS_FILE, reportes_actuales)
+                        guardar_evento_auditoria("REPORTE FISICO DE GASTOS", f"{suc_rf} · {fecha_rf_str} · ${total_gastos_rf:,.2f} · {len(filas_gasto)} conceptos · {rid}")
+                        st.session_state.rf_nonce += 1
+                        st.success(f"Reporte de gastos guardado ({rid}). Ya cuenta en balances y cierres.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo guardar el reporte: {exc}")
+
+    # ---------------- LISTA ----------------
+    with sub_lista:
+        todos_rf = [r for r in _leer_lista_json(FISICOS_FILE) if es_global or r.get("Sitio / Unidad") == st.session_state.sucursal_asignada]
+        if not todos_rf:
+            st.info("Aún no hay reportes físicos subidos.")
+        else:
+            filtro_suc = st.selectbox("Sucursal", ["Todas"] + sorted({r.get("Sitio / Unidad", "") for r in todos_rf}), key="rf_filtro_suc")
+            visibles_rf = [r for r in todos_rf if filtro_suc == "Todas" or r.get("Sitio / Unidad") == filtro_suc]
+            st.dataframe(pd.DataFrame([{
+                "Fecha": r.get("Fecha"), "Sucursal": r.get("Sitio / Unidad"),
+                "Tipo": "Ingresos" if r.get("tipo_reporte") == "ingresos" else "Gastos",
+                "Importe ($)": r.get("Ingreso Bruto") if r.get("tipo_reporte") == "ingresos" else r.get("Total Gastos"),
+                "Subió": r.get("Usuario"), "Fecha de subida": r.get("Timestamp"), "ID": r.get("ID"),
+            } for r in visibles_rf]), use_container_width=True, hide_index=True)
+            etiquetas_rf = {f"{r.get('Fecha')} · {r.get('Sitio / Unidad')} · {'Ingresos' if r.get('tipo_reporte') == 'ingresos' else 'Gastos'} · {r.get('ID')}": r for r in visibles_rf}
+            elegido = etiquetas_rf[st.selectbox("Ver fotos y detalle", list(etiquetas_rf.keys()), key="rf_ver_detalle")]
+            if elegido.get("tipo_reporte") == "gastos":
+                st.dataframe(pd.DataFrame(elegido.get("detalle_gastos", [])), use_container_width=True, hide_index=True)
+            cols_fx = st.columns(3)
+            for i_fx, ruta_fx in enumerate(elegido.get("fotos", [])):
+                pf = Path(ruta_fx)
+                if pf.exists():
+                    cols_fx[i_fx % 3].image(str(pf), use_container_width=True)
+
+    # ---------------- REPORTE POR SUCURSAL / GLOBAL ----------------
+    with sub_reporte:
+        st.caption("Ventas, gastos y utilidad (ventas menos gastos) por sucursal o de todas juntas, con la venta de cada día de lunes a domingo. Descárgalo por semana, quincena, mes o un periodo a tu medida.")
+        hoy_r = datetime.now().date()
+        pr1, pr2 = st.columns(2)
+        tipo_periodo = pr1.radio("Periodo", ["Semana", "Quincena", "Mes", "Personalizado"], horizontal=True, key="rp_tipo")
+        referencia_r = pr2.date_input("Cualquier día del periodo", value=hoy_r, key="rp_ref")
+        desde_pers = hasta_pers = None
+        if tipo_periodo == "Personalizado":
+            pp1, pp2 = st.columns(2)
+            desde_pers = pp1.date_input("Desde", value=hoy_r - timedelta(days=6), key="rp_desde_pers")
+            hasta_pers = pp2.date_input("Hasta", value=hoy_r, key="rp_hasta_pers")
+        desde_r, hasta_r = rango_periodo(tipo_periodo, referencia_r, desde_pers, hasta_pers)
+        if hasta_r < desde_r:
+            st.error("La fecha final no puede ser anterior a la inicial.")
+        else:
+            periodo_txt = f"Periodo: {desde_r:%d/%m/%Y} al {hasta_r:%d/%m/%Y} ({(hasta_r - desde_r).days + 1} días)"
+            st.info(periodo_txt)
+            if es_global:
+                alcance = st.radio("Alcance", ["🌐 Global (todas las sucursales)", "🏢 Una sucursal"], horizontal=True, key="rp_alcance")
+            else:
+                alcance = "🏢 Una sucursal"
+            if alcance.startswith("🌐"):
+                sucursales_r = SUCURSALES
+                titulo_r = "CLUB PARK · REPORTE GLOBAL DE TODAS LAS SUCURSALES"
+            else:
+                suc_unica = st.selectbox("Sucursal", sucursales_rf, key="rp_sucursal")
+                sucursales_r = [suc_unica]
+                titulo_r = f"CLUB PARK · REPORTE DE {suc_unica}"
+            rep_r = construir_reporte(desde_r, hasta_r, sucursales_r)
+            u_tot = rep_r["ventas_total"] - rep_r["gastos_total"]
+
+            comparar = st.checkbox("📊 Comparar contra el periodo anterior", value=True, key="rp_comparar")
+            comp = None
+            desde_p = hasta_p = None
+            hasta_c, hasta_pc = hasta_r, hasta_r
+            rep_c, rep_p = rep_r, None
+            if comparar:
+                desde_p, hasta_p = rango_anterior(tipo_periodo, desde_r, hasta_r)
+                hasta_c, hasta_pc = hasta_r, hasta_p
+                if hasta_r > hoy_r >= desde_r:
+                    st.warning("El periodo actual aún no termina. Comparar contra el periodo anterior completo haría ver una caída por los días pendientes.")
+                    if st.checkbox("Comparar solo los días transcurridos (mismos días en ambos periodos)", value=True, key="rp_mismos_dias"):
+                        hasta_c = hoy_r
+                        hasta_pc = desde_p + timedelta(days=(hoy_r - desde_r).days)
+                rep_c = rep_r if hasta_c == hasta_r else construir_reporte(desde_r, hasta_c, sucursales_r)
+                rep_p = construir_reporte(desde_p, hasta_pc, sucursales_r)
+                comp = construir_comparativo(rep_c, rep_p)
+                st.info(f"Comparando {desde_r:%d/%m/%Y} al {hasta_c:%d/%m/%Y} contra {desde_p:%d/%m/%Y} al {hasta_pc:%d/%m/%Y}")
+
+            def _delta_txt(actual, anterior):
+                pct = _variacion_pct(actual, anterior)
+                return None if pct is None or rep_p is None else f"{pct:+.1f}% vs periodo anterior"
+
+            k1, k2, k3, k4 = st.columns(4)
+            if rep_p is not None:
+                v_c, g_c = rep_c["ventas_total"], rep_c["gastos_total"]
+                v_p, g_p = rep_p["ventas_total"], rep_p["gastos_total"]
+                k1.metric("Vendió", f"${rep_r['ventas_total']:,.2f}", delta=_delta_txt(v_c, v_p))
+                k2.metric("Gastos", f"${rep_r['gastos_total']:,.2f}", delta=_delta_txt(g_c, g_p), delta_color="inverse")
+                k3.metric("Utilidad", f"${u_tot:,.2f}", delta=_delta_txt(v_c - g_c, v_p - g_p))
+            else:
+                k1.metric("Vendió", f"${rep_r['ventas_total']:,.2f}")
+                k2.metric("Gastos", f"${rep_r['gastos_total']:,.2f}")
+                k3.metric("Utilidad", f"${u_tot:,.2f}")
+            k4.metric("Margen", f"{(u_tot / rep_r['ventas_total'] * 100) if rep_r['ventas_total'] else 0:,.1f}%")
+            st.caption("Utilidad = ventas − gastos. Ventas: reporte físico de ingresos de la sucursal y fecha; si no hay, los cobros digitales. Gastos: todos los capturados en la app y los reportes de gastos.")
+
+            st.markdown("#### 🏢 Resultado por sucursal")
+            st.dataframe(rep_r["resumen_total"], use_container_width=True, hide_index=True, column_config=formato_columnas_df(rep_r["resumen_total"]))
+            if len(sucursales_r) > 1 and rep_r["ventas_total"] > 0:
+                st.bar_chart(rep_r["resumen"].set_index("Sucursal")[["Ventas", "Gastos", "Utilidad"]])
+
+            if comp is not None:
+                st.markdown("#### 📊 Comparativo contra el periodo anterior")
+                df_comp = comp["resumen"]
+                st.dataframe(df_comp, use_container_width=True, hide_index=True, column_config=formato_columnas_df(df_comp))
+                datos_comp = df_comp[df_comp["Sucursal"] != "TOTAL"]
+                datos_comp = datos_comp[(datos_comp["Ventas actual"] > 0) | (datos_comp["Ventas anterior"] > 0)]
+                if len(da

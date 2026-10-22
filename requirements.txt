@@ -1,0 +1,14 @@
+streamlit>=1.40
+pandas
+numpy
+pillow
+openpyxl
+xlsxwriter
+qrcode[pil]
+cryptography
+requests
+pytesseract
+opencv-python-headless
+zxing-cpp
+pyzbar
+supabase

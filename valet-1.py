@@ -287,7 +287,7 @@ PRECIOS_SUCURSALES = {
     "SUMO STA. MONICA": 50,
     "SUMO ECHEGARAY": 50,
     "RYOSHI": 80,
-    "ENCANTO": 60,
+    "ENCANTO": 90,
     "E-BNI": 50,
     "CHURRASQUERIA": 70,
 }

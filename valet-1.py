@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CLUB PARK VALET Y ESTACIONAMIENTOS S.A. DE C.V.
+CLUB PARK VALET Y ESTACIONAMIENTOS S.A. DE C.V
 Sistema de control operativo con Streamlit.
 
 IMPORTANTE:

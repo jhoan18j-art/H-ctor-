@@ -12,3 +12,9 @@ opencv-python-headless
 zxing-cpp
 pyzbar
 supabase
+streamlit
+pandas
+openpyxl
+Pillow
+qrcode
+anthropic

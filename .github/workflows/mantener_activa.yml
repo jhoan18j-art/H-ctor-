@@ -1,6 +1,5 @@
 # Mantiene despierta la app de Streamlit Community Cloud.
-# Cada 8 horas abre la app en un navegador real; si está dormida, pulsa el botón de despertar.
-# Configura en GitHub: Settings > Secrets and variables > Actions > Variables > APP_URL = https://TU-APP.streamlit.app
+# Cada 8 horas abre la app en un navegador real; si está dormida, pulsa el botón para despertarla.
 name: Mantener app activa
 on:
   schedule:
@@ -9,29 +8,34 @@ on:
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Abrir la app
         env:
-          APP_URL: ${{ vars.APP_URL }}
+          APP_URL: ${{ vars.APP_URL || secrets.APP_URL || 'https://4ghcvznkjbm3ta6wtogocm.streamlit.app' }}
         run: |
           pip install playwright
           playwright install --with-deps chromium
           python - <<'PY'
           import os
           from playwright.sync_api import sync_playwright
-          url = os.environ["APP_URL"].rstrip("/") + "/?ping=1"
+          url = (os.environ.get("APP_URL") or "https://4ghcvznkjbm3ta6wtogocm.streamlit.app").strip().rstrip("/")
+          print("Abriendo:", url)
           with sync_playwright() as p:
               b = p.chromium.launch()
               pg = b.new_page()
-              pg.goto(url, wait_until="domcontentloaded", timeout=120000)
-              pg.wait_for_timeout(8000)
+              pg.goto(url + "/?ping=1", wait_until="domcontentloaded", timeout=120000)
+              pg.wait_for_timeout(10000)
               boton = pg.get_by_role("button", name="Yes, get this app back up!")
               if boton.count():
-                  boton.click()
-                  pg.wait_for_timeout(60000)
-              print("Título:", pg.title())
+                  print("La app estaba dormida: despertando...")
+                  boton.first.click()
+                  pg.wait_for_timeout(90000)
+              else:
+                  print("La app ya estaba despierta.")
+              print("Titulo:", pg.title())
               b.close()
           PY

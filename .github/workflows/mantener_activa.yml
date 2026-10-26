@@ -3,7 +3,7 @@
 name: Mantener app activa
 on:
   schedule:
-    - cron: "0 */8 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 jobs:
   ping:

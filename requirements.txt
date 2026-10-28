@@ -10,3 +10,4 @@ opencv-python-headless
 zxing-cpp
 pyzbar
 google-genai
+pypdf
